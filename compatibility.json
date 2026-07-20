@@ -3,6 +3,8 @@
   "name": "solarisael-house-substrate",
   "version": "0.1.0",
   "substrateApi": 1,
+  "coreApi": 1,
+  "adapterApi": 1,
   "schemaVersion": 1,
   "embedding": {
     "defaultModel": "qwen3-embedding:4b",

@@ -103,7 +103,7 @@ def probe_database() -> dict:
             extensions = [row[0] for row in cur.fetchall()]
             cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ANY(%s)", (list(REQUIRED_TABLES),))
             tables = {row[0] for row in cur.fetchall()}
-            cur.execute("SELECT coalesce(max(version), 0) FROM schema_migrations")
+            cur.execute("SELECT coalesce(max((substring(version::text from '^[0-9]+'))::integer), 0) FROM schema_migrations")
             schema_version = cur.fetchone()[0]
         conn.close()
         missing = sorted(set(REQUIRED_TABLES) - tables)
