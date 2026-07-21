@@ -172,6 +172,31 @@ For any writer that accepts lesson text, `--lesson-stdin` can replace
 `--lesson`.  Cabinet entries use `add` or `append-rep`; see each script's
 `--help` for its remaining typed fields.
 
+## Starter coding lessons
+
+This repository includes a privacy-safe starter pack with 14 reusable engineering lessons.
+
+Preview the pack before import:
+
+```bash
+python3 import_coding_lessons.py --dry-run
+```
+
+Import the pack after Full House health passes:
+
+```bash
+python3 import_coding_lessons.py
+```
+
+The default import preserves existing lessons with the same scope, project, and title.
+
+Use `--update-existing` only when the operator chooses to replace those lesson fields with the bundled versions.
+
+The importer runs one transaction. A successful write runs the normal backup unless `--no-backup` is present.
+
+Use `--pack PATH` to validate and import another pack that follows schema version 1.
+
+
 The shipped query CLIs are project and audio only:
 
 ```bash
@@ -196,8 +221,8 @@ It writes `backups/${PGDATABASE}_TIMESTAMP.dump` and retains the newest
 `--no-backup` is supplied.  `--no-backup` is supported by
 `record_memory.py`, `record_coding_lesson.py`, `record_project_lesson.py`,
 `record_writing_lesson.py`, `record_audio_lesson.py`,
-`record_cabinet_entry.py`, `import_markdown.py`, and
-`import_named_entities.py`.  `backup.sh` itself has no `--no-backup` option.
+`record_cabinet_entry.py`, `import_markdown.py`, `import_named_entities.py`,
+and `import_coding_lessons.py`. `backup.sh` itself has no `--no-backup` option.
 
 The write is not rolled back when its post-write backup fails: helper scripts
 print a `WARN: backup failed ...` message and return the write result.  A

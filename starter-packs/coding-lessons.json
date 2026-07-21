@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "pack": {
+    "id": "solarisael-house-craft-starter",
+    "version": 1,
+    "title": "Solarisael House craft starter",
+    "description": "A privacy-safe starter set of reusable engineering lessons from the House.",
+    "license": "Apache-2.0"
+  },
+  "lessons": [
+    {
+      "scope": "shared",
+      "title": "The spine: plain line, clean door, sharp refusal",
+      "lesson": "Write the plain line. Leave one clean path through the system. Make every boundary state what it refuses.",
+      "trigger_context": "Architecture, implementation, review, or any design with several competing paths.",
+      "proof_pattern": "A reader can identify the main path, its boundary, and its rejected states without reconstructing hidden intent.",
+      "shape": "spine",
+      "voice": "house",
+      "always_on": true,
+      "tags": ["craft", "clarity", "boundaries", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Make the first draft loud, then compress it",
+      "lesson": "Use the long honest form until the real seam becomes visible. Compress only when the shorter form preserves the complete truth.",
+      "trigger_context": "Early implementation, unclear boundaries, premature abstractions, or dense first drafts.",
+      "proof_pattern": "The final form is shorter because one concept became clear, not because names or behavior disappeared.",
+      "shape": "process",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["drafting", "abstraction", "clarity", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "A file should have one silhouette",
+      "lesson": "Give each file one purpose. Every declaration in that file must support the same center of gravity.",
+      "trigger_context": "Files that mix unrelated helpers, state, constants, classes, or runtime roles.",
+      "proof_pattern": "Describe the file in one sentence. Split it when important contents do not fit that sentence.",
+      "shape": "structure",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["files", "cohesion", "structure", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "A helper with a vague name exposes the wrong seam",
+      "lesson": "Do not ship helpers named with helper, util, or several joined actions. Find the actual boundary and name that operation.",
+      "trigger_context": "New helpers with vague names, several responsibilities, or names joined with and.",
+      "proof_pattern": "The helper name identifies one operation and one boundary without generic suffixes or combined actions.",
+      "shape": "naming",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["helpers", "naming", "abstraction", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Refuse helpers that only launder anxiety",
+      "lesson": "Remove wrappers that only rename a standard call or split a small coherent function. Keep helpers that own a real policy or boundary.",
+      "trigger_context": "One-line wrappers, pass-through helpers, unnecessary indirection, or speculative organization.",
+      "proof_pattern": "Removing the helper reduces indirection without duplicating policy, behavior, or error handling.",
+      "shape": "refusal",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["helpers", "indirection", "yagni", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Count minimalism in concepts, not characters",
+      "lesson": "Minimize abstractions, dependencies, and indirection. Do not remove plain names, useful spacing, or visible decisions to shorten the source.",
+      "trigger_context": "Code golf, dense expressions, compressed diffs, or claims that fewer lines always mean simpler code.",
+      "proof_pattern": "The chosen form requires fewer concepts from the next reader, even when it uses more lines.",
+      "shape": "clarity",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["minimalism", "readability", "maintainability", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Delete the clever line when the plain line reads better",
+      "lesson": "Prefer visible control flow over dense expressions that require rereading. Compression must earn its cognitive cost.",
+      "trigger_context": "Nested expressions, stacked comprehensions, chained transformations, or clever one-line control flow.",
+      "proof_pattern": "A first-time reader can follow each decision once without decoding the expression backward.",
+      "shape": "clarity",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["control-flow", "readability", "simplicity", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Use negative space as punctuation",
+      "lesson": "Place blank lines at completed thoughts and concern boundaries. Do not space by quota or remove every rest.",
+      "trigger_context": "Cramped functions, noisy spacing, long loops, guard clauses, or formatting reviews.",
+      "proof_pattern": "Each blank line marks a named transition. Each completed concern has enough space to remain visible.",
+      "shape": "structure",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["formatting", "spacing", "readability", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Write documentation in simplified technical English",
+      "lesson": "Use one idea per sentence, active voice, present tense, and one term per concept. Put each warning before its related instruction.",
+      "trigger_context": "README files, procedures, deployment guides, operator instructions, and technical reference material.",
+      "proof_pattern": "Procedural sentences stay under 20 words. Descriptive sentences stay under 25 words. Commands use the imperative form.",
+      "shape": "clarity",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["documentation", "ste100", "accessibility", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Explore existing behavior before rebuilding it",
+      "lesson": "Inspect the working implementation and its tests before replacing a subsystem. Classify each behavior before designing the new seam.",
+      "trigger_context": "Ports, adapters, rewrites, replacement runtimes, extractions, or new implementations of existing behavior.",
+      "proof_pattern": "The change includes a behavior inventory with required, excluded, and superseded behavior before implementation begins.",
+      "shape": "process",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["exploration", "rewrites", "regression-guard", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Do not hard-code the current example to green",
+      "lesson": "Fix the behavioral class instead of adding the latest names, phrases, identifiers, or paths to production logic.",
+      "trigger_context": "A failing example suggests a new regex, exception, route, fixture, or special-case branch.",
+      "proof_pattern": "Synthetic tests cover the failure shape. A differently worded equivalent input passes through the same structured mechanism.",
+      "shape": "process",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["overfitting", "hard-coding", "regression-tests", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Merge by intent before side",
+      "lesson": "Do not choose ours, theirs, newest, or oldest by reflex. Name each intention and preserve every compatible invariant.",
+      "trigger_context": "Merge conflicts, same-file overlap, collaborator synchronization, or branch promotion.",
+      "proof_pattern": "The merge records both intentions, names surviving invariants, and verifies them in the integrated tree.",
+      "shape": "process",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["git", "merge", "collaboration", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Branch promotion is not runtime proof",
+      "lesson": "Treat commits, pushes, CI, deployment, and live behavior as separate facts. Prove each claimed stage independently.",
+      "trigger_context": "Deployment, branch promotion, release checkpoints, or claims that work is live.",
+      "proof_pattern": "Report the commit, remote ref, pipeline result, rollout state, and observable live behavior separately.",
+      "shape": "verification",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["deployment", "git", "runtime-proof", "starter-pack"]
+    },
+    {
+      "scope": "shared",
+      "title": "Verify cleanup and inspect the staged set",
+      "lesson": "Confirm that temporary artifacts are gone. Inspect every staged path before committing instead of trusting a broad staging command.",
+      "trigger_context": "Cleanup, temporary files, generated evidence, staging, commits, or cross-shell deletion.",
+      "proof_pattern": "The temporary paths no longer exist. The staged set contains only required files in their correct locations.",
+      "shape": "verification",
+      "voice": "house",
+      "always_on": false,
+      "tags": ["cleanup", "git", "staging", "starter-pack"]
+    }
+  ]
+}
