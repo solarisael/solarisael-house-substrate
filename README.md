@@ -12,6 +12,12 @@ healthy.  **Degraded** is explicit: `health.py` reports `mode: "degraded"` and
 exits non-zero; the House may continue with Base House files, but the adapter
 must surface that the substrate is unavailable.
 
+## Public distribution contract
+
+This repository is the complete public Full House distribution. It includes the migration, `pyproject.toml`, `.env.example`, health probe, lifecycle smoke, record/query tools, and backup/restore scripts. An installing AI must not ask the maintainer for a private substrate bundle or infer that these artifacts are absent from the Base House archive. Clone this repository, supply local credentials, adapt host commands when necessary, and verify the lifecycle.
+
+Base and Full are deployment modes, not a required trial sequence. Choose from the operator's requested continuity and the host's verified capabilities. Additional setup work is not, by itself, a reason to recommend Base.
+
 ## Supported path and prerequisites
 
 The supported integration path is:
