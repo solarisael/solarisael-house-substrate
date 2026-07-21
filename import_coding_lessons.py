@@ -14,7 +14,13 @@ from backup_runner import run_backup
 
 DEFAULT_PACK = Path(__file__).parent / "starter-packs" / "coding-lessons.json"
 REQUIRED_TEXT_FIELDS = ("title", "lesson", "shape")
-OPTIONAL_TEXT_FIELDS = ("project", "voice", "trigger_context", "proof_pattern")
+OPTIONAL_TEXT_FIELDS = (
+    "project",
+    "voice",
+    "trigger_context",
+    "proof_pattern",
+    "negation_of_title",
+)
 
 
 def load_dotenv(path: Path) -> None:
@@ -115,6 +121,19 @@ def load_pack(path: Path) -> dict[str, Any]:
             raise ValueError(f"duplicate lesson key: {key}")
         keys.add(key)
 
+    for lesson in lessons:
+        target_title = lesson["negation_of_title"]
+        if target_title is None:
+            continue
+        source_key = (lesson["scope"], lesson["project"], lesson["title"])
+        target_key = (lesson["scope"], lesson["project"], target_title)
+        if target_key == source_key:
+            raise ValueError(f"lesson cannot negate itself: {lesson['title']}")
+        if target_key not in keys:
+            raise ValueError(
+                f"negation target is not in the pack: {lesson['title']} -> {target_title}"
+            )
+
     return {
         "id": pack_id,
         "version": version,
@@ -124,19 +143,31 @@ def load_pack(path: Path) -> dict[str, Any]:
     }
 
 
-def find_existing(cur: Any, lesson: dict[str, Any]) -> int | None:
+def find_lesson(
+    cur: Any,
+    scope: str,
+    project: str | None,
+    title: str,
+) -> tuple[int, int | None] | None:
     cur.execute(
         """
-        SELECT id
+        SELECT id, negation_of
         FROM coding_lessons
         WHERE scope = %s
           AND project IS NOT DISTINCT FROM %s
           AND title = %s
         """,
-        (lesson["scope"], lesson["project"], lesson["title"]),
+        (scope, project, title),
     )
     row = cur.fetchone()
-    return int(row[0]) if row else None
+    if not row:
+        return None
+    return int(row[0]), int(row[1]) if row[1] is not None else None
+
+
+def find_existing(cur: Any, lesson: dict[str, Any]) -> int | None:
+    row = find_lesson(cur, lesson["scope"], lesson["project"], lesson["title"])
+    return row[0] if row else None
 
 
 def insert_lesson(cur: Any, lesson: dict[str, Any]) -> None:
@@ -192,8 +223,46 @@ def update_lesson(cur: Any, lesson_id: int, lesson: dict[str, Any]) -> None:
     )
 
 
+def link_negations(
+    cur: Any,
+    lessons: list[dict[str, Any]],
+    update_existing: bool,
+) -> dict[str, int]:
+    counts = {"linked": 0, "link_skipped": 0}
+    for lesson in lessons:
+        target_title = lesson["negation_of_title"]
+        if target_title is None:
+            continue
+        source = find_lesson(cur, lesson["scope"], lesson["project"], lesson["title"])
+        target = find_lesson(cur, lesson["scope"], lesson["project"], target_title)
+        if source is None or target is None:
+            raise ValueError(
+                f"cannot resolve negation link: {lesson['title']} -> {target_title}"
+            )
+        source_id, current_target_id = source
+        target_id, _ = target
+        if current_target_id == target_id:
+            counts["link_skipped"] += 1
+            continue
+        if current_target_id is not None and not update_existing:
+            counts["link_skipped"] += 1
+            continue
+        cur.execute(
+            "UPDATE coding_lessons SET negation_of = %s WHERE id = %s",
+            (target_id, source_id),
+        )
+        counts["linked"] += 1
+    return counts
+
+
 def import_pack(conn: Any, pack: dict[str, Any], update_existing: bool) -> dict[str, int]:
-    counts = {"inserted": 0, "updated": 0, "skipped": 0}
+    counts = {
+        "inserted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "linked": 0,
+        "link_skipped": 0,
+    }
     with conn, conn.cursor() as cur:
         for lesson in pack["lessons"]:
             lesson_id = find_existing(cur, lesson)
@@ -205,6 +274,7 @@ def import_pack(conn: Any, pack: dict[str, Any], update_existing: bool) -> dict[
                 counts["updated"] += 1
             else:
                 counts["skipped"] += 1
+        counts.update(link_negations(cur, pack["lessons"], update_existing))
     return counts
 
 
@@ -250,9 +320,10 @@ def main() -> int:
             conn.close()
         print(
             f"inserted={counts['inserted']} updated={counts['updated']} "
-            f"skipped={counts['skipped']}"
+            f"skipped={counts['skipped']} linked={counts['linked']} "
+            f"link_skipped={counts['link_skipped']}"
         )
-        if counts["inserted"] + counts["updated"] > 0:
+        if counts["inserted"] + counts["updated"] + counts["linked"] > 0:
             run_backup(__file__, skip=args.no_backup)
         return 0
     except (OSError, ValueError) as exc:

@@ -174,7 +174,7 @@ For any writer that accepts lesson text, `--lesson-stdin` can replace
 
 ## Starter coding lessons
 
-This repository includes a privacy-safe starter pack with 14 reusable engineering lessons.
+This repository includes a privacy-safe library with 117 reusable coding lessons and no project lessons.
 
 Preview the pack before import:
 
@@ -191,6 +191,8 @@ python3 import_coding_lessons.py
 The default import preserves existing lessons with the same scope, project, and title.
 
 Use `--update-existing` only when the operator chooses to replace those lesson fields with the bundled versions.
+
+The pack preserves 12 formal lesson negations by title. The importer resolves those links after all rows exist.
 
 The importer runs one transaction. A successful write runs the normal backup unless `--no-backup` is present.
 
