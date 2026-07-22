@@ -57,13 +57,29 @@ fi
 BACKUP_DIR="$(pwd)/backups"
 mkdir -p "$BACKUP_DIR"
 
+if [[ -n "${SOLARISAEL_BACKUP_DATABASE_URL:-}" ]]; then
+  BACKUP_TARGET="$SOLARISAEL_BACKUP_DATABASE_URL"
+  BACKUP_PASSWORD="${SOLARISAEL_BACKUP_PASSWORD:-}"
+  PGDATABASE="${PGDATABASE:-substrate}"
+else
+  BACKUP_TARGET=""
+  BACKUP_PASSWORD="${PGPASSWORD:-}"
+fi
+
 ts="$(date +%Y-%m-%d_%H%M%S)"
 out="$BACKUP_DIR/${PGDATABASE}_${ts}.dump"
 
-PGPASSWORD="${PGPASSWORD:-}" pg_dump \
-  -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-  -Fc --no-owner --no-acl \
-  -f "$out"
+if [[ -n "$BACKUP_TARGET" ]]; then
+  PGPASSWORD="$BACKUP_PASSWORD" pg_dump \
+    --dbname="$BACKUP_TARGET" \
+    -Fc --no-owner --no-acl \
+    -f "$out"
+else
+  PGPASSWORD="$BACKUP_PASSWORD" pg_dump \
+    -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+    -Fc --no-owner --no-acl \
+    -f "$out"
+fi
 
 bytes=$(stat -c %s "$out")
 printf 'wrote %s (%s bytes)\n' "$out" "$bytes"

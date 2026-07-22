@@ -26,7 +26,7 @@ The supported integration path is:
 - WSL 2 with Ubuntu; run every substrate Python command inside WSL
 - PostgreSQL 16 with pgvector **0.7 or newer** and `pg_trgm`
 - Python 3.11+
-- Ollama with `qwen3-embedding:4b`
+- Ollama with `hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest`
 
 The external commands used below are `bash`, `sudo`, `curl`, `gpg`, `git`,
 `make`, `gcc`, `psql`, `pg_dump`, `pg_restore`, `python3`, `pip`, and
@@ -46,7 +46,7 @@ normally `/mnt/c/Projects/solarisael-house-substrate`.
 
 Run these commands in WSL.  The PGDG repository supplies PostgreSQL 16; the
 source build pins pgvector to the first 0.7 release, which satisfies the
-substrate's `halfvec` requirement.  `pg_trgm` comes from PostgreSQL contrib.
+substrate's current vector requirements. `pg_trgm` comes from PostgreSQL contrib.
 
 ```bash
 sudo apt update
@@ -106,7 +106,7 @@ In the second terminal:
 ```bash
 cd /mnt/c/Projects/solarisael-house-substrate
 . .venv/bin/activate
-ollama pull qwen3-embedding:4b
+ollama pull hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest
 python3 run_migrations.py
 ```
 
@@ -266,9 +266,9 @@ Keep these values exact when integrating the public contract:
 substrateApi=1
 coreApi=1
 adapterApi=1
-schemaVersion=1
+schemaVersion=2
 ```
 
-The default embedding contract is `qwen3-embedding:4b` with dimension `2560`.
-Changing the model requires a full reindex; changing dimensions also requires
-a schema migration.
+The default embedding contract is `hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest`
+with dimension `2048`. Changing the model requires a full reindex; changing
+dimensions also requires a schema migration.

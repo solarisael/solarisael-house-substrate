@@ -286,7 +286,7 @@ def main() -> None:
                         cur.execute(
                             """
                             UPDATE memory_chunks
-                            SET body_embedding = %s::halfvec,
+                            SET body_embedding = %s::vector,
                                 embedded_at = NOW()
                             WHERE id = %s
                             """,

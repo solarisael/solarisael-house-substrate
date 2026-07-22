@@ -52,9 +52,9 @@ def load_dotenv(path: Path) -> None:
 
 
 def probe_embedding(timeout: float) -> dict:
-    url = os.environ.get("SOLARISAEL_EMBED_URL", "http://127.0.0.1:11434/api/embed")
-    model = os.environ.get("SOLARISAEL_EMBED_MODEL", "qwen3-embedding:4b")
-    raw_expected = os.environ.get("SOLARISAEL_EMBED_DIMENSION", "2560")
+    url = os.environ.get("SOLARISAEL_EMBED_URL", "http://127.0.0.1:11435/api/embed")
+    model = os.environ.get("SOLARISAEL_EMBED_MODEL", "hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest")
+    raw_expected = os.environ.get("SOLARISAEL_EMBED_DIMENSION", "2048")
     try:
         expected = int(raw_expected)
     except ValueError:
@@ -64,7 +64,7 @@ def probe_embedding(timeout: float) -> dict:
             "model": model,
             "error": f"SOLARISAEL_EMBED_DIMENSION must be an integer, got {raw_expected!r}",
         }
-    payload = json.dumps({"model": model, "input": "solarisael house health"}).encode("utf-8")
+    payload = json.dumps({"model": model, "input": "passage: solarisael house health"}).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""4B daily-driver embedding pass — embed all memories with Qwen3-Embedding-4B.
+"""Canonical embedding pass — embed all memories with Nemotron-3-Embed-1B.
 
-Mirrors embed_8b_pass.py but targets the canonical `memory_chunks` table with
-halfvec(2560) storage instead of the transient memory_chunks_8b/vector(4096).
-The chunker is identical; the only differences are the embedding model name,
-the embedding dim, and the destination table.
+Targets the canonical ``memory_chunks`` table with vector(2048) storage.
+Documents use the model's required ``passage: `` retrieval prefix.
 
 Idempotent: re-running only embeds chunks that don't yet have embeddings.
 Resumable: process can be killed and restarted; picks up where it left off.
@@ -44,10 +42,13 @@ def configure_embedding() -> None:
 
     EMBED_URL = _os.environ.get(
         "SOLARISAEL_EMBED_URL",
-        _os.environ.get("SOLARISAEL_LMSTUDIO_URL", "http://localhost:11434/api/embed"),
+        _os.environ.get("SOLARISAEL_LMSTUDIO_URL", "http://localhost:11435/api/embed"),
     )
-    EMBED_MODEL = _os.environ.get("SOLARISAEL_EMBED_MODEL", "qwen3-embedding:4b")
-    raw_dimension = _os.environ.get("SOLARISAEL_EMBED_DIMENSION", "2560")
+    EMBED_MODEL = _os.environ.get(
+        "SOLARISAEL_EMBED_MODEL",
+        "hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest",
+    )
+    raw_dimension = _os.environ.get("SOLARISAEL_EMBED_DIMENSION", "2048")
     try:
         EMBED_DIM = int(raw_dimension)
     except ValueError as exc:
@@ -247,7 +248,7 @@ def chunk_memory(body: str, max_chars: int, target: int, overlap: int) -> list[d
 
 # -------- embedding client (ollama or openai-compat) --------
 def embed_batch(texts: list[str], retries: int = 3, timeout: int = 120) -> list[list[float]]:
-    payload = json.dumps({"model": EMBED_MODEL, "input": texts}).encode("utf-8")
+    payload = json.dumps({"model": EMBED_MODEL, "input": [f"passage: {text}" for text in texts]}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     last_err: Exception | None = None
     for attempt in range(retries):
@@ -307,8 +308,8 @@ def main() -> None:
         ver = cur.fetchone()
         if not ver:
             sys.exit("FATAL: pgvector extension not present")
-        if ver[0] < "0.7":
-            sys.exit(f"FATAL: pgvector {ver[0]} too old; halfvec needs 0.7+")
+        if ver[0] < "0.4":
+            sys.exit(f"FATAL: pgvector {ver[0]} too old; vector support needs 0.4+")
         cur.execute("SELECT to_regclass('memory_chunks')")
         if cur.fetchone()[0] is None:
             sys.exit("FATAL: memory_chunks table missing — run run_migrations.py")
@@ -399,7 +400,7 @@ def main() -> None:
                     cur.execute(
                         """
                         UPDATE memory_chunks
-                        SET body_embedding = %s::halfvec,
+                        SET body_embedding = %s::vector,
                             embedded_at    = NOW()
                         WHERE id = %s
                         """,

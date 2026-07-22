@@ -148,7 +148,7 @@ def cmd_add(args, conn) -> None:
                 (room, kind, fidelity, activation, active, title, shape,
                  peak, beginning, ramp, counsel, verify_note,
                  source_paths, canon_links, tags, body_embedding, embedded_at, meta)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::halfvec,NOW(),%s::jsonb)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,NOW(),%s::jsonb)
             ON CONFLICT (room, title) DO UPDATE SET
                 kind=EXCLUDED.kind, fidelity=EXCLUDED.fidelity,
                 activation=EXCLUDED.activation, active=EXCLUDED.active,
