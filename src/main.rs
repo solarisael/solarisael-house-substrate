@@ -20,13 +20,32 @@ struct ProtocolRememberRequest {
     room: String,
     kind: String,
     title: String,
+    #[serde(default)]
     body: String,
     #[serde(default)]
+    lesson: Option<String>,
+    #[serde(default)]
     source_path: Option<String>,
+    #[serde(default)]
+    source_memory_path: Option<String>,
     #[serde(default)]
     threads: Vec<String>,
     #[serde(default)]
     supersedes: Vec<String>,
+    #[serde(default)]
+    shape: Option<String>,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default, alias = "proofPattern")]
+    proof_pattern: Option<String>,
+    #[serde(default, alias = "triggerContext")]
+    trigger_context: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
     #[serde(default = "default_backup")]
     backup: bool,
 }
@@ -95,13 +114,9 @@ fn parse_request(value: Value) -> Result<ProtocolRequest, String> {
         serde_json::from_value(value).map_err(|e| format!("params must be a remember request: {e}"))?;
     let mut supersedes = BTreeSet::new();
     for raw in request.supersedes {
-        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("supersedes must contain positive decimal strings".into());
-        }
+        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) { return Err("supersedes must contain positive decimal strings".into()); }
         let id = raw.parse::<i64>().map_err(|_| "supersedes ID is out of range".to_string())?;
-        if id <= 0 {
-            return Err("supersedes must contain positive IDs".into());
-        }
+        if id <= 0 { return Err("supersedes must contain positive IDs".into()); }
         supersedes.insert(id);
     }
     Ok(ProtocolRequest::Remember(RememberRequest {
@@ -109,9 +124,18 @@ fn parse_request(value: Value) -> Result<ProtocolRequest, String> {
         kind: request.kind,
         title: request.title,
         body: request.body,
+        lesson: request.lesson,
         source_path: request.source_path,
+        source_memory_path: request.source_memory_path,
         threads: request.threads,
         supersedes: supersedes.into_iter().collect(),
+        shape: request.shape,
+        voice: request.voice,
+        scope: request.scope,
+        project: request.project,
+        proof_pattern: request.proof_pattern,
+        trigger_context: request.trigger_context,
+        tags: request.tags,
         backup: request.backup,
     }))
 }

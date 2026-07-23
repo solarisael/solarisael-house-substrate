@@ -1,10 +1,13 @@
 use chrono::{Local, NaiveDate};
 use regex::Regex;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use sqlx::{postgres::{PgConnectOptions, PgPoolOptions}, PgPool};
-use std::{collections::{BTreeMap, BTreeSet}, env, fs, io, path::Path, process::Command, str::FromStr};
-use sqlx::Row;
+use serde::{Deserialize, Serialize, Serializer};
+use serde::ser::SerializeStruct;
+use sqlx::{PgPool, PgConnection, Row, postgres::{PgConnectOptions, PgPoolOptions}};
+use std::{collections::{BTreeMap, BTreeSet}, env, fs, io};
+use std::path::Path;
+use std::process::Command;
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -79,34 +82,119 @@ impl Config {
         Ok(pool)
     }
 }
-
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
-    pub room: String, pub kind: String, pub title: String, pub body: String,
-    pub source_path: Option<String>, #[serde(default)] pub threads: Vec<String>,
-    #[serde(default)] pub supersedes: Vec<i64>, #[serde(default = "default_backup")] pub backup: bool,
+    pub room: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub lesson: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub source_memory_path: Option<String>,
+    #[serde(default)]
+    pub threads: Vec<String>,
+    #[serde(default)]
+    pub supersedes: Vec<i64>,
+    #[serde(default)]
+    pub shape: Option<String>,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default, alias = "proofPattern")]
+    pub proof_pattern: Option<String>,
+    #[serde(default, alias = "triggerContext")]
+    pub trigger_context: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_backup")]
+    pub backup: bool,
 }
 fn default_backup() -> bool { true }
 
-#[derive(Debug, Serialize)]
-pub struct RememberReceipt { pub memory_id: i64, pub room: String, pub source_path: String, pub durable: bool, pub authority: &'static str, pub warnings: Vec<String> }
+fn is_zero(value: &i64) -> bool { *value == 0 }
+
+#[derive(Debug)]
+pub struct RememberReceipt {
+    pub memory_id: i64,
+    pub lesson_id: i64,
+    pub kind: String,
+    pub room: String,
+    pub source_path: String,
+    pub durable: bool,
+    pub authority: &'static str,
+    pub warnings: Vec<String>,
+}
+
+impl Serialize for RememberReceipt {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.memory_id != 0 {
+            let mut out = serializer.serialize_struct("RememberReceipt", 6)?;
+            out.serialize_field("memory_id", &self.memory_id)?;
+            out.serialize_field("room", &self.room)?;
+            out.serialize_field("source_path", &self.source_path)?;
+            out.serialize_field("durable", &self.durable)?;
+            out.serialize_field("authority", &self.authority)?;
+            out.serialize_field("warnings", &self.warnings)?;
+            out.end()
+        } else {
+            let mut out = serializer.serialize_struct("RememberReceipt", 5)?;
+            out.serialize_field("lesson_id", &self.lesson_id)?;
+            out.serialize_field("kind", &self.kind)?;
+            out.serialize_field("durable", &self.durable)?;
+            out.serialize_field("authority", &self.authority)?;
+            out.serialize_field("warnings", &self.warnings)?;
+            out.end()
+        }
+    }
+}
 
 impl RememberRequest {
     pub fn validate(&self) -> Result<(), AppError> {
         let room_re = Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap();
         if !room_re.is_match(&self.room) || self.room == "house" { return Err(AppError::Invalid("room must be a lowercase slug and cannot be house".into())); }
-        if self.kind != "memory" { return Err(AppError::Invalid("only kind=memory is supported".into())); }
+        let lessons = ["coding-lesson", "project-lesson", "writing-lesson", "audio-lesson"];
+        let text = self.lesson.as_deref().unwrap_or(&self.body);
         if self.title.trim().is_empty() { return Err(AppError::Invalid("title must not be empty".into())); }
-        if self.body.trim().is_empty() { return Err(AppError::Invalid("body must not be empty".into())); }
-        if self.source_path.as_ref().is_some_and(|p| p.trim().is_empty()) { return Err(AppError::Invalid("source_path must not be empty".into())); }
-        if self.supersedes.iter().any(|id| *id <= 0) { return Err(AppError::Invalid("supersedes must contain positive IDs".into())); }
+        if text.trim().is_empty() { return Err(AppError::Invalid("body/lesson must not be empty".into())); }
+        if self.kind == "memory" {
+            if self.lesson.is_some() || self.source_memory_path.is_some() || self.shape.is_some() || self.voice.is_some() || self.scope.is_some() || self.project.is_some() || self.proof_pattern.is_some() || self.trigger_context.is_some() || !self.tags.is_empty() {
+                return Err(AppError::Invalid("lesson-only fields are not valid for memory".into()));
+            }
+            if self.source_path.as_ref().is_some_and(|p| p.trim().is_empty()) { return Err(AppError::Invalid("source_path must not be empty".into())); }
+            if self.supersedes.iter().any(|id| *id <= 0) { return Err(AppError::Invalid("supersedes must contain positive IDs".into())); }
+        } else if lessons.contains(&self.kind.as_str()) {
+            if !self.threads.is_empty() || !self.supersedes.is_empty() || self.source_path.is_some() { return Err(AppError::Invalid("threads/supersedes/source_path are memory-only".into())); }
+            if self.source_memory_path.as_ref().is_some_and(|p| p.trim().is_empty()) { return Err(AppError::Invalid("source_memory_path must not be empty".into())); }
+            let unsupported = match self.kind.as_str() {
+                "coding-lesson" => false,
+                "project-lesson" => self.voice.is_some() || self.shape.is_some() || self.scope.is_some(),
+                "writing-lesson" => self.scope.is_some() || self.project.is_some() || self.proof_pattern.is_some(),
+                "audio-lesson" => self.voice.is_some() || self.scope.is_some() || self.project.is_some() || self.proof_pattern.is_some(),
+                _ => true,
+            };
+            if unsupported { return Err(AppError::Invalid("lesson fields are unsupported by this lesson table".into())); }
+            if self.kind == "project-lesson" && self.project.as_deref().unwrap_or("").trim().is_empty() { return Err(AppError::Invalid("project is required for project lessons".into())); }
+        } else {
+            return Err(AppError::Invalid("unsupported remember kind".into()));
+        }
         Ok(())
     }
     fn source_path(&self) -> String { self.source_path.clone().unwrap_or_else(|| format!("db-only/{}/{}", self.room, Uuid::new_v4())) }
+    fn lesson_body(&self) -> &str { self.lesson.as_deref().unwrap_or(&self.body) }
 }
 
 pub async fn remember(pool: &PgPool, cfg: &Config, req: RememberRequest) -> Result<RememberReceipt, AppError> {
     req.validate()?;
+    if req.kind != "memory" {
+        return remember_lesson(pool, cfg, &req).await;
+    }
     let source_path = req.source_path();
     let threads = normalize_threads(&req.threads);
     let primary_date = Local::now().date_naive();
@@ -121,9 +209,8 @@ pub async fn remember(pool: &PgPool, cfg: &Config, req: RememberRequest) -> Resu
     sqlx::query("DELETE FROM memory_chunks WHERE memory_id=$1").bind(memory_id).execute(&mut *tx).await?;
     let chunks = chunk_body(&req.body);
     let mut warnings = Vec::new();
-    if cfg.test_embedding_disabled {
-        warnings.push("embedding disabled for isolated test; chunks cleared".into());
-    } else {
+    if cfg.test_embedding_disabled { warnings.push("embedding disabled for isolated test; chunks cleared".into()); }
+    else {
         let url = cfg.embed_url.as_deref().ok_or_else(|| AppError::Embedding("embedding endpoint is required".into()))?;
         let vectors = embed(&Client::new(), url, &cfg.embed_model, &chunks, cfg.embed_dimension).await?;
         if vectors.len() != chunks.len() { return Err(AppError::Embedding("embedding count mismatch".into())); }
@@ -135,7 +222,31 @@ pub async fn remember(pool: &PgPool, cfg: &Config, req: RememberRequest) -> Resu
     }
     tx.commit().await?;
     if req.backup { if let Err(e) = run_backup(&cfg.database_url) { warnings.push(format!("backup failed: {e}")); } }
-    Ok(RememberReceipt { memory_id: memory_id, room: req.room, source_path, durable: true, authority: "postgres", warnings })
+    Ok(RememberReceipt { memory_id, lesson_id: 0, kind: "memory".into(), room: req.room, source_path, durable: true, authority: "postgres", warnings })
+}
+
+async fn remember_lesson(pool: &PgPool, cfg: &Config, req: &RememberRequest) -> Result<RememberReceipt, AppError> {
+    let text = req.lesson_body();
+    let tags = req.tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    let meta = serde_json::json!({"origin":"direct-db-write", "kind": req.kind, "recorded_at": chrono::Utc::now().to_rfc3339()});
+    let mut tx = pool.begin().await?;
+    let id = match req.kind.as_str() {
+        "coding-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO coding_lessons (scope,project,voice,shape,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (scope,project,title) DO UPDATE SET project=EXCLUDED.project,voice=EXCLUDED.voice,shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(req.scope.as_deref().unwrap_or("shared")).bind(&req.project).bind(&req.voice).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&req.proof_pattern).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "project-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO project_lessons (project,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (project,title) DO UPDATE SET lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(req.project.as_deref().unwrap()).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&req.proof_pattern).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO writing_lessons (voice,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (voice,title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(req.voice.as_deref().unwrap_or("general")).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO audio_lessons (shape,title,lesson,trigger_context,tags,source_memory_path) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path RETURNING id")
+            .bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).fetch_one(&mut *tx).await?,
+        _ => return Err(AppError::Invalid("unsupported remember kind".into())),
+    };
+    tx.commit().await?;
+    let mut warnings = Vec::new();
+    if req.backup && matches!(req.kind.as_str(), "project-lesson" | "audio-lesson") {
+        if let Err(e) = run_backup(&cfg.database_url) { warnings.push(format!("backup failed: {e}")); }
+    }
+    Ok(RememberReceipt { memory_id: 0, lesson_id: id, kind: req.kind.clone(), room: req.room.clone(), source_path: String::new(), durable: true, authority: "postgres", warnings })
 }
 
 fn backup_target(database_url: &str) -> Result<(String, Option<String>), String> {
@@ -427,8 +538,22 @@ pub async fn process_request(pool: &PgPool, cfg: &Config, req: RememberRequest) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn rejects_bad_room(){let r=RememberRequest{room:"House".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),source_path:None,threads:vec![],supersedes:vec![],backup:false};assert!(r.validate().is_err());}
-    #[test] fn source_is_db_only(){let r=RememberRequest{room:"room".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),source_path:None,threads:vec![],supersedes:vec![],backup:false};assert!(r.source_path().starts_with("db-only/"));}
+    #[test] fn rejects_bad_room(){let r=RememberRequest{room:"House".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),lesson:None,source_path:None,source_memory_path:None,threads:vec![],supersedes:vec![],shape:None,voice:None,scope:None,project:None,proof_pattern:None,trigger_context:None,tags:vec![],backup:false};assert!(r.validate().is_err());}
+    #[test] fn source_is_db_only(){let r=RememberRequest{room:"room".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),lesson:None,source_path:None,source_memory_path:None,threads:vec![],supersedes:vec![],shape:None,voice:None,scope:None,project:None,proof_pattern:None,trigger_context:None,tags:vec![],backup:false};assert!(r.source_path().starts_with("db-only/"));}
+    #[test] fn lesson_validation_enforces_project_and_memory_field_boundaries() {
+        let mut project = RememberRequest { room:"room".into(), kind:"project-lesson".into(), title:"t".into(), body:"unicode\n多行".into(), lesson:None, source_path:None, source_memory_path:None, threads:vec![], supersedes:vec![], shape:None, voice:None, scope:None, project:None, proof_pattern:Some("proof".into()), trigger_context:None, tags:vec!["a".into()], backup:false };
+        assert!(project.validate().is_err());
+        project.project = Some("app".into());
+        assert!(project.validate().is_ok());
+        project.kind = "memory".into();
+        assert!(project.validate().is_err());
+    }
+    #[test] fn lesson_receipt_serializes_typed_identity() {
+        let value = serde_json::to_value(RememberReceipt { memory_id:0, lesson_id:7, kind:"writing-lesson".into(), room:"room".into(), source_path:"db-only/x".into(), durable:true, authority:"postgres", warnings:vec![] }).unwrap();
+        assert_eq!(value["lesson_id"], 7);
+        assert_eq!(value["kind"], "writing-lesson");
+        assert!(value.get("memory_id").is_none());
+    }
     #[test] fn recall_defaults_and_validation(){let p:RecallParams=serde_json::from_value(serde_json::json!({"room":"room","query":"alpha"})).unwrap();assert_eq!(p.semantic_top_k,8);assert_eq!(p.content_top_k,8);assert!(p.validate().is_ok());}
     #[test] fn recall_rejects_unknown_empty_and_bounds(){assert!(serde_json::from_value::<RecallParams>(serde_json::json!({"room":"room","query":"x","extra":1})).is_err());let mut p=RecallParams{room:"room".into(),query:" ".into(),semantic_top_k:8,semantic_min_similarity:0.5,content_top_k:8,content_min_similarity:0.3};assert!(p.validate().is_err());p.query="x".into();p.semantic_min_similarity=f64::NAN;assert!(p.validate().is_err());}
     #[test] fn lexical_evidence_uses_wire_term_names_and_is_deterministic() {

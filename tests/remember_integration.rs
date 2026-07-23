@@ -30,9 +30,18 @@ async fn isolated_database_guard() {
         kind: "memory".into(),
         title: "isolated integration proof".into(),
         body: "This mutation proves the dedicated PostgreSQL authority path.".into(),
+        lesson: None,
         source_path: Some(source_path.clone()),
+        source_memory_path: None,
         threads: vec!["integration".into()],
         supersedes: vec![],
+        shape: None,
+        voice: None,
+        scope: None,
+        project: None,
+        proof_pattern: None,
+        trigger_context: None,
+        tags: vec![],
         backup: false,
     }).await.expect("remember mutation must commit");
     assert_eq!(receipt.authority, "postgres");
