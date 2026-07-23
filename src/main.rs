@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solarisael_house_substrate::{process_request, recall, AppError, Config, RecallParams, RememberRequest};
+use solarisael_house_substrate::{process_request, recall, anamnesis, anamnesis_write, AppError, Config, RecallParams, RememberRequest, AnamnesisParams, AnamnesisWrite};
 use std::collections::BTreeSet;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
@@ -54,6 +54,8 @@ struct ProtocolRememberRequest {
 enum ProtocolRequest {
     Remember(RememberRequest),
     Recall(RecallParams),
+    Anamnesis(AnamnesisParams),
+    AnamnesisWrite(AnamnesisWrite),
 }
 
 fn default_backup() -> bool { true }
@@ -146,6 +148,18 @@ fn parse_recall(value: Value) -> Result<ProtocolRequest, String> {
         .map_err(|e| format!("params must be recall parameters: {e}"))
 }
 
+fn parse_anamnesis(value: Value) -> Result<ProtocolRequest, String> {
+    serde_json::from_value(value)
+        .map(ProtocolRequest::Anamnesis)
+        .map_err(|e| format!("params must be anamnesis parameters: {e}"))
+}
+
+fn parse_anamnesis_write(value: Value) -> Result<ProtocolRequest, String> {
+    serde_json::from_value(value)
+        .map(ProtocolRequest::AnamnesisWrite)
+        .map_err(|e| format!("params must be anamnesis_write parameters: {e}"))
+}
+
 fn decode_line(line: &str) -> (String, Result<ProtocolRequest, String>) {
     let parsed: Result<Envelope, _> = serde_json::from_str(line);
     let env = match parsed {
@@ -171,6 +185,8 @@ fn decode_line(line: &str) -> (String, Result<ProtocolRequest, String>) {
     match method {
         "remember" => (id, parse_request(params)),
         "recall" => (id, parse_recall(params)),
+        "anamnesis" => (id, parse_anamnesis(params)),
+        "anamnesis_write" => (id, parse_anamnesis_write(params)),
         _ => (id, Err("method is not supported".into())),
     }
 }
@@ -208,6 +224,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     id: id.clone(),
                     body: Body::Result { result: &result },
                 })?,
+                Err(e) => app_error(id.clone(), e),
+            },
+            Ok(ProtocolRequest::Anamnesis(params)) => match anamnesis(&pool, params).await {
+                Ok(result) => serde_json::to_string(&Response { protocol: 1, id: id.clone(), body: Body::Result { result: &result } })?,
+                Err(e) => app_error(id.clone(), e),
+            },
+            Ok(ProtocolRequest::AnamnesisWrite(req)) => match anamnesis_write(&pool, &cfg, req).await {
+                Ok(result) => serde_json::to_string(&Response { protocol: 1, id: id.clone(), body: Body::Result { result: &result } })?,
                 Err(e) => app_error(id.clone(), e),
             },
             Err(message) => {
