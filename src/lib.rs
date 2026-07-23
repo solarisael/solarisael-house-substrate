@@ -3,7 +3,8 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::{PgConnectOptions, PgPoolOptions}, PgPool};
-use std::{collections::BTreeSet, env, fs, io, path::Path, process::Command, str::FromStr};
+use std::{collections::{BTreeMap, BTreeSet}, env, fs, io, path::Path, process::Command, str::FromStr};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -189,11 +190,14 @@ fn chunk_body(body: &str) -> Vec<(String, usize, usize, Option<String>)> {
             sections.push((*start, headings.get(i + 1).map(|(s, _)| *s).unwrap_or(chars.len()), heading.clone()));
         }
     }
+    let byte_at = |char_index: usize| -> usize {
+        body.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(body.len())
+    };
     let mut out = Vec::new();
     for (start, end, heading) in sections {
         let text: String = chars[start..end].iter().collect();
         if text.chars().count() <= 4000 {
-            if !text.trim().is_empty() { out.push((text, start, end, Some(heading))); }
+            if !text.trim().is_empty() { out.push((text, byte_at(start), byte_at(end), Some(heading))); }
             continue;
         }
         let mut paragraphs = Vec::new();
@@ -211,11 +215,8 @@ fn chunk_body(body: &str) -> Vec<(String, usize, usize, Option<String>)> {
         for &(paragraph_start, paragraph_end) in paragraphs.iter().skip(1) {
             if buf_end - buf_start + (paragraph_end - paragraph_start) + 2 > 2200 {
                 pieces.push((buf_start, buf_end));
-                let tail_start = buf_end.saturating_sub(200);
-                buf_start = tail_start;
+                buf_start = buf_end.saturating_sub(200);
                 buf_end = paragraph_end;
-                // The source separator is between the overlap tail and this paragraph.
-                if buf_start > 0 && buf_start < paragraph_start { buf_end = paragraph_end; }
             } else {
                 buf_end = paragraph_end;
             }
@@ -223,7 +224,7 @@ fn chunk_body(body: &str) -> Vec<(String, usize, usize, Option<String>)> {
         pieces.push((buf_start, buf_end));
         for (piece_start, piece_end) in pieces {
             let piece: String = chars[piece_start..piece_end].iter().collect();
-            if !piece.trim().is_empty() { out.push((piece, piece_start, piece_end, Some(heading.clone()))); }
+            if !piece.trim().is_empty() { out.push((piece, byte_at(piece_start), byte_at(piece_end), Some(heading.clone()))); }
         }
     }
     out
@@ -237,6 +238,189 @@ async fn embed(client: &Client, url: &str, model: &str, chunks: &[(String,usize,
     let arr=value.get("embeddings").or_else(||value.get("data")).and_then(|v|v.as_array()).ok_or_else(||AppError::Embedding("response lacks embeddings".into()))?; let mut out=Vec::new();
     for item in arr { let v=item.as_array().or_else(||item.get("embedding").and_then(|x|x.as_array())).ok_or_else(||AppError::Embedding("invalid embedding vector".into()))?; let row:Vec<f32>=v.iter().map(|x|x.as_f64().map(|n|n as f32).ok_or_else(||AppError::Embedding("non-numeric embedding".into()))).collect::<Result<_,_>>()?; if row.len()!=dim{return Err(AppError::Embedding(format!("embedding dimension {} != {}",row.len(),dim)));} out.push(row); } Ok(out)
 }
+fn default_semantic_top_k() -> u32 { 8 }
+fn default_semantic_min_similarity() -> f64 { 0.50 }
+fn default_content_top_k() -> u32 { 8 }
+fn default_content_min_similarity() -> f64 { 0.30 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallParams {
+    pub room: String,
+    pub query: String,
+    #[serde(default = "default_semantic_top_k")] pub semantic_top_k: u32,
+    #[serde(default = "default_semantic_min_similarity")] pub semantic_min_similarity: f64,
+    #[serde(default = "default_content_top_k")] pub content_top_k: u32,
+    #[serde(default = "default_content_min_similarity")] pub content_min_similarity: f64,
+}
+
+impl RecallParams {
+    pub fn validate(&self) -> Result<(), AppError> {
+        let room_re = Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap();
+        if !room_re.is_match(&self.room) || self.room == "house" { return Err(AppError::Invalid("room must be a lowercase slug and cannot be house".into())); }
+        if self.query.trim().is_empty() { return Err(AppError::Invalid("query must not be empty".into())); }
+        for (name, value) in [("semantic_top_k", self.semantic_top_k), ("content_top_k", self.content_top_k)] {
+            if value == 0 || value > 1000 { return Err(AppError::Invalid(format!("{name} must be positive and at most 1000"))); }
+        }
+        for (name, value) in [("semantic_min_similarity", self.semantic_min_similarity), ("content_min_similarity", self.content_min_similarity)] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) { return Err(AppError::Invalid(format!("{name} must be finite and in [0, 1]"))); }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecallResult {
+    pub ok: bool,
+    pub query: String,
+    pub found: bool,
+    pub source: &'static str,
+    pub warnings: Vec<String>,
+    #[serde(rename = "retrievalCandidates")] pub retrieval_candidates: Vec<serde_json::Value>,
+    #[serde(rename = "canonMatches")] pub canon_matches: Vec<serde_json::Value>,
+    #[serde(rename = "semanticChunks")] pub semantic_chunks: Vec<serde_json::Value>,
+    #[serde(rename = "contentChunks")] pub content_chunks: Vec<serde_json::Value>,
+    #[serde(rename = "dateMatches")] pub date_matches: Vec<serde_json::Value>,
+    #[serde(rename = "queryDates")] pub query_dates: Vec<serde_json::Value>,
+    pub taxonomy: serde_json::Value,
+}
+
+fn query_dates(query: &str) -> Vec<NaiveDate> {
+    let re = Regex::new(r"\b(20\d{2})-(\d{2})-(\d{2})\b").unwrap();
+    re.captures_iter(query).filter_map(|c| NaiveDate::from_ymd_opt(c[1].parse().ok()?, c[2].parse().ok()?, c[3].parse().ok()?)).collect::<BTreeSet<_>>().into_iter().collect()
+}
+fn query_terms(query: &str) -> Vec<String> {
+    query.split(|c: char| !c.is_alphanumeric())
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| term.len() >= 2)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn term_evidence(terms: &[String], fields: &[&str]) -> (Vec<String>, Vec<String>) {
+    let haystack = fields.join(" ").to_ascii_lowercase();
+    let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).cloned().collect::<Vec<_>>();
+    let missing = terms.iter().filter(|term| !matched.contains(term)).cloned().collect::<Vec<_>>();
+    (matched, missing)
+}
+
+
+async fn embed_query(client: &Client, url: &str, model: &str, query: &str, dim: usize) -> Result<Vec<f32>, AppError> {
+    #[derive(Serialize)] struct Input<'a> { model: &'a str, input: Vec<String> }
+    let value: serde_json::Value = client.post(url).json(&Input { model, input: vec![format!("query: {query}")] }).send().await.map_err(|e| AppError::Embedding(e.to_string()))?.error_for_status().map_err(|e| AppError::Embedding(e.to_string()))?.json().await.map_err(|e| AppError::Embedding(e.to_string()))?;
+    let item = value.get("embeddings").or_else(|| value.get("data")).and_then(|v| v.as_array()).and_then(|a| a.first()).ok_or_else(|| AppError::Embedding("response lacks query embedding".into()))?;
+    let v = item.as_array().or_else(|| item.get("embedding").and_then(|x| x.as_array())).ok_or_else(|| AppError::Embedding("invalid query embedding".into()))?;
+    let row = v.iter().map(|x| x.as_f64().map(|n| n as f32).ok_or_else(|| AppError::Embedding("non-numeric query embedding".into()))).collect::<Result<Vec<_>,_>>()?;
+    if row.len() != dim { return Err(AppError::Embedding(format!("embedding dimension {} != {}",row.len(),dim))); }
+    Ok(row)
+}
+
+fn bounded_excerpt(body: &str) -> String {
+    const MAX: usize = 1200;
+    let excerpt: String = body.chars().take(MAX).collect();
+    if body.chars().count() > MAX { format!("{excerpt}…") } else { excerpt }
+}
+
+fn candidate_terms(terms: &[String], fields: &[&str]) -> (Vec<String>, Vec<String>, f64) {
+    let (matched, missing) = term_evidence(terms, fields);
+    let coverage = if terms.is_empty() { 0.0 } else { matched.len() as f64 / terms.len() as f64 };
+    (matched, missing, coverage)
+}
+pub async fn recall(pool: &PgPool, cfg: &Config, params: RecallParams) -> Result<RecallResult, AppError> {
+    params.validate()?;
+    let query_dates = query_dates(&params.query);
+    let query_terms = query_terms(&params.query);
+    let rooms = vec![params.room.clone(), "house".to_string()];
+    let mut warnings = Vec::new();
+    let vector_text = match (cfg.test_embedding_disabled, cfg.embed_url.as_deref()) {
+        (true, _) => { warnings.push("semantic lane absent: embedding disabled".to_string()); None }
+        (false, Some(url)) => match embed_query(&Client::new(), url, &cfg.embed_model, &params.query, EMBED_DIMENSION).await {
+            Ok(vector) => Some(format!("[{}]", vector.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))),
+            Err(e) => { warnings.push(format!("semantic lane absent: {e}")); None }
+        },
+        (false, None) => { warnings.push("semantic lane absent: embedding endpoint is required".to_string()); None }
+    };
+    let mut semantic_chunks = Vec::new();
+    if let Some(vector_text) = vector_text {
+        let semantic_rows = sqlx::query("SELECT m.source_path,coalesce(m.title,'') AS title,coalesce(c.heading_path,'') AS heading_path,c.body,c.char_start,c.char_end,c.chunk_index,(1-(c.body_embedding <=> $1::vector))::double precision AS sim FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.room = ANY($2::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL AND c.body_embedding IS NOT NULL ORDER BY sim DESC,m.source_path,c.chunk_index LIMIT $3")
+            .bind(&vector_text).bind(&rooms).bind(params.semantic_top_k as i64).fetch_all(pool).await?;
+        for row in semantic_rows {
+            let sim: f64 = row.try_get("sim")?;
+            if sim < params.semantic_min_similarity { continue; }
+            let source_path: String = row.try_get("source_path")?;
+            let title: Option<String> = row.try_get("title")?;
+            let heading_path: Option<String> = row.try_get("heading_path")?;
+            let body: String = row.try_get("body")?;
+            let (matched_terms, missing_terms, coverage) = candidate_terms(&query_terms, &[&source_path, title.as_deref().unwrap_or(""), heading_path.as_deref().unwrap_or(""), &body]);
+            semantic_chunks.push(serde_json::json!({"source_path":source_path,"title":title,"heading_path":heading_path,"body":bounded_excerpt(&body),"char_start":row.try_get::<i32,_>("char_start")?,"char_end":row.try_get::<i32,_>("char_end")?,"chunk_index":row.try_get::<i32,_>("chunk_index")?,"sim":sim,"matched_terms":matched_terms,"missing_terms":missing_terms,"term_coverage":coverage,"evidence":"semantic cosine similarity"}));
+        }
+    }
+    let content_rows = sqlx::query("SELECT m.source_path,coalesce(m.title,'') AS title,coalesce(c.heading_path,'') AS heading_path,c.body,c.char_start,c.char_end,c.chunk_index,word_similarity(c.body,$1)::double precision AS sim FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.room = ANY($2::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL AND ($5::text[] = '{}'::text[] OR EXISTS (SELECT 1 FROM unnest($5::text[]) term WHERE lower(c.body) LIKE '%' || term || '%')) AND word_similarity(c.body,$1) >= $3 ORDER BY sim DESC,m.source_path,c.chunk_index LIMIT $4")
+        .bind(&params.query).bind(&rooms).bind(params.content_min_similarity).bind(params.content_top_k as i64).bind(&query_terms).fetch_all(pool).await?;
+    let mut content_chunks = Vec::new();
+    for row in content_rows {
+        let sim: f64 = row.try_get("sim")?;
+        let source_path: String = row.try_get("source_path")?;
+        let title: Option<String> = row.try_get("title")?;
+        let heading_path: Option<String> = row.try_get("heading_path")?;
+        let body: String = row.try_get("body")?;
+        let (matched_terms, missing_terms, coverage) = candidate_terms(&query_terms, &[&source_path, title.as_deref().unwrap_or(""), heading_path.as_deref().unwrap_or(""), &body]);
+        content_chunks.push(serde_json::json!({"source_path":source_path,"title":title,"heading_path":heading_path,"body":bounded_excerpt(&body),"char_start":row.try_get::<i32,_>("char_start")?,"char_end":row.try_get::<i32,_>("char_end")?,"chunk_index":row.try_get::<i32,_>("chunk_index")?,"ws":sim,"matched_terms":matched_terms,"missing_terms":missing_terms,"term_coverage":coverage,"evidence":"lexical word_similarity"}));
+    }
+    let mut date_matches = Vec::new();
+    if !query_dates.is_empty() {
+        let rows = sqlx::query("SELECT source_path,title,body,date,dates FROM memories WHERE room = ANY($1::text[]) AND archived_at IS NULL AND superseded_by IS NULL AND dates && $2::date[] ORDER BY source_path LIMIT 5")
+            .bind(&rooms).bind(&query_dates).fetch_all(pool).await?;
+        for row in rows {
+            let source_path: String = row.try_get("source_path")?;
+            let title: Option<String> = row.try_get("title")?;
+            let body: String = row.try_get("body")?;
+            let dates: Vec<NaiveDate> = row.try_get("dates")?;
+            let (matched_terms, missing_terms, coverage) = candidate_terms(&query_terms, &[&source_path, title.as_deref().unwrap_or(""), &body]);
+            date_matches.push(serde_json::json!({"source_path":source_path,"title":title,"body_excerpt":bounded_excerpt(&body),"excerpt":bounded_excerpt(&body),"date":row.try_get::<Option<NaiveDate>,_>("date")?.map(|d|d.to_string()),"dates":dates.into_iter().map(|d|d.to_string()).collect::<Vec<_>>(),"score":1.0,"reason":"date match","matched_terms":matched_terms,"missing_terms":missing_terms,"term_coverage":coverage}));
+        }
+    }
+    let mut fused: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (rank, c) in semantic_chunks.iter().enumerate() {
+        let key = format!("{}#{}", c["source_path"].as_str().unwrap_or(""), c["chunk_index"].as_i64().unwrap_or(0));
+        let score = c["sim"].as_f64().unwrap_or(0.0) * 0.6 + 1.0 / (rank as f64 + 1.0) * 0.4;
+        fused.insert(key, serde_json::json!({"source_path":c["source_path"],"title":c["title"],"heading_path":c["heading_path"],"excerpt":c["body"],"sources":[c["source_path"]],"term_coverage":c["term_coverage"],"matched_terms":c["matched_terms"],"missing_terms":c["missing_terms"],"score":score,"semantic_score":c["sim"],"reasons":["semantic cosine similarity"],"source":"semantic","chunk_index":c["chunk_index"]}));
+    }
+    for (rank, c) in content_chunks.iter().enumerate() {
+        let key = format!("{}#{}", c["source_path"].as_str().unwrap_or(""), c["chunk_index"].as_i64().unwrap_or(0));
+        let score = c["ws"].as_f64().unwrap_or(0.0) * 0.6 + 1.0 / (rank as f64 + 1.0) * 0.4;
+        if let Some(existing) = fused.get_mut(&key) {
+            existing["score"] = serde_json::json!(existing["score"].as_f64().unwrap_or(0.0) + score);
+            existing["content_score"] = c["ws"].clone();
+            existing["source"] = serde_json::json!("semantic+content");
+            existing["reasons"] = serde_json::json!(["semantic cosine similarity","lexical word_similarity"]);
+        } else {
+            fused.insert(key, serde_json::json!({"source_path":c["source_path"],"title":c["title"],"heading_path":c["heading_path"],"excerpt":c["body"],"sources":[c["source_path"]],"term_coverage":c["term_coverage"],"matched_terms":c["matched_terms"],"missing_terms":c["missing_terms"],"score":score,"content_score":c["ws"],"reasons":["lexical word_similarity"],"source":"content","chunk_index":c["chunk_index"]}));
+        }
+    }
+    let mut retrieval_candidates: Vec<_> = fused.into_values().collect();
+    retrieval_candidates.sort_by(|a,b| b["score"].as_f64().unwrap_or(0.0).partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a["source_path"].as_str().cmp(&b["source_path"].as_str())).then_with(|| a["chunk_index"].as_i64().cmp(&b["chunk_index"].as_i64())));
+    retrieval_candidates.truncate(params.semantic_top_k.max(params.content_top_k) as usize);
+    let canon_rows = sqlx::query("SELECT name,kind,summary,aliases,weighty,pointer_files FROM named_entities WHERE room = ANY($1::text[]) AND (lower(name) = ANY($2::text[]) OR EXISTS (SELECT 1 FROM unnest(aliases) alias WHERE lower(alias) = ANY($2::text[]))) ORDER BY name LIMIT 12")
+        .bind(&rooms).bind(&query_terms).fetch_all(pool).await?;
+    let mut canon_matches = Vec::new();
+    let mut named_entities = Vec::new();
+    for row in canon_rows {
+        let name: String = row.try_get("name")?;
+        let kind: String = row.try_get("kind")?;
+        let summary: String = row.try_get("summary")?;
+        let aliases: Vec<String> = row.try_get("aliases")?;
+        let weighty: bool = row.try_get("weighty")?;
+        let files: serde_json::Value = row.try_get("pointer_files")?;
+        canon_matches.push(serde_json::json!({"termKey":name,"entry":{"type":kind,"summary":bounded_excerpt(&summary),"aliases":aliases,"weighty":weighty,"files":files}}));
+        named_entities.push(name);
+    }
+    let memory_types: Vec<String> = sqlx::query_scalar("SELECT DISTINCT type FROM memories WHERE room = ANY($1::text[]) AND archived_at IS NULL AND superseded_by IS NULL ORDER BY type LIMIT 20").bind(&rooms).fetch_all(pool).await?;
+    let thread_keys: Vec<String> = sqlx::query_scalar("SELECT DISTINCT thread_key FROM memory_threads t JOIN memories m ON m.id=t.memory_id WHERE m.room = ANY($1::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL ORDER BY thread_key LIMIT 20").bind(&rooms).fetch_all(pool).await?;
+    let taxonomy = serde_json::json!({"rooms":rooms,"memoryTypes":memory_types,"threadKeys":thread_keys,"namedEntities":named_entities});
+    Ok(RecallResult { ok:true, query:params.query, found:!retrieval_candidates.is_empty() || !canon_matches.is_empty() || !date_matches.is_empty(), source:"rust-postgres", warnings, retrieval_candidates, canon_matches, semantic_chunks, content_chunks, date_matches, query_dates:query_dates.into_iter().map(|d|serde_json::json!(d.to_string())).collect(), taxonomy })
+}
 
 pub async fn process_request(pool: &PgPool, cfg: &Config, req: RememberRequest) -> Result<RememberReceipt, AppError> { remember(pool,cfg,req).await }
 
@@ -245,15 +429,33 @@ mod tests {
     use super::*;
     #[test] fn rejects_bad_room(){let r=RememberRequest{room:"House".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),source_path:None,threads:vec![],supersedes:vec![],backup:false};assert!(r.validate().is_err());}
     #[test] fn source_is_db_only(){let r=RememberRequest{room:"room".into(),kind:"memory".into(),title:"x".into(),body:"y".into(),source_path:None,threads:vec![],supersedes:vec![],backup:false};assert!(r.source_path().starts_with("db-only/"));}
-    #[test] fn unicode_chunks_use_chars(){let c=chunk_body("éé");assert_eq!((c[0].1,c[0].2), (0,2));assert!(token_estimate("é")>0);}
+    #[test] fn recall_defaults_and_validation(){let p:RecallParams=serde_json::from_value(serde_json::json!({"room":"room","query":"alpha"})).unwrap();assert_eq!(p.semantic_top_k,8);assert_eq!(p.content_top_k,8);assert!(p.validate().is_ok());}
+    #[test] fn recall_rejects_unknown_empty_and_bounds(){assert!(serde_json::from_value::<RecallParams>(serde_json::json!({"room":"room","query":"x","extra":1})).is_err());let mut p=RecallParams{room:"room".into(),query:" ".into(),semantic_top_k:8,semantic_min_similarity:0.5,content_top_k:8,content_min_similarity:0.3};assert!(p.validate().is_err());p.query="x".into();p.semantic_min_similarity=f64::NAN;assert!(p.validate().is_err());}
+    #[test] fn lexical_evidence_uses_wire_term_names_and_is_deterministic() {
+        let terms = query_terms("Alpha 2026-07-22 alpha");
+        assert_eq!(terms, vec!["07".to_string(), "2026".to_string(), "22".to_string(), "alpha".to_string()]);
+        let (matched, missing) = term_evidence(&terms, &["An alpha memory"]);
+        assert_eq!(matched, vec!["alpha".to_string()]);
+        assert_eq!(missing, vec!["07".to_string(), "2026".to_string(), "22".to_string()]);
+        let candidate = serde_json::json!({"matched_terms": matched, "missing_terms": missing, "body_excerpt": "An alpha memory"});
+        assert!(candidate.get("matched_terms").is_some());
+        assert!(candidate.get("missing_terms").is_some());
+        assert!(candidate.get("body_excerpt").is_some());
+        assert!(candidate.get("terms").is_none());
+        assert!(candidate.get("excerpt").is_none());
+    }
+    #[test] fn unicode_chunks_use_utf8_bytes(){let c=chunk_body("éé");assert_eq!((c[0].1,c[0].2), (0,4));assert_eq!(&"éé"[c[0].1..c[0].2],"éé");assert!(token_estimate("é")>0);}
     #[test] fn oversized_chunks_preserve_separator_and_span(){
         let first="a".repeat(2200); let body=format!("{first}\n\né{}", "b".repeat(2500));
         let chunks=chunk_body(&body); let (text,start,end,_)=&chunks[1];
-        assert_eq!(text, &body.chars().collect::<Vec<_>>()[*start..*end].iter().collect::<String>());
+        assert_eq!(text, &body[*start..*end]);
         assert!(text.contains("\n\né"));
     }
     #[test] fn derive_dates_uses_injected_primary_date(){let d=NaiveDate::from_ymd_opt(2026,7,22).unwrap();assert!(derive_dates("db-only/room/no-date",d).contains(&d));}
     #[test] fn backup_target_strips_password(){let (target,password)=backup_target("postgres://alice:secret@db.example/memory").unwrap();assert_eq!(password.as_deref(),Some("secret"));assert!(!target.contains("secret"));assert!(target.contains("db.example/memory"));}
     #[test] fn threads_normalize(){assert_eq!(normalize_threads(&[" a ".into()," ".into(),"a".into()]),vec!["a"]);}
     #[test] fn backup_command_targets_resolved_db_without_password_arg(){let command=build_backup_command("postgres://alice:secret@db.example/memory").unwrap();let envs=command.get_envs().filter_map(|(k,v)|Some((k.to_string_lossy().into_owned(),v?.to_string_lossy().into_owned()))).collect::<std::collections::BTreeMap<_,_>>();assert_eq!(envs.get("SOLARISAEL_BACKUP_DATABASE_URL").map(String::as_str),Some("postgres://alice@db.example/memory"));assert_eq!(envs.get("SOLARISAEL_BACKUP_PASSWORD").map(String::as_str),Some("secret"));}
+    #[test] fn bounded_excerpt_is_character_safe_and_limited(){let body="é".repeat(1300);let excerpt=bounded_excerpt(&body);assert!(excerpt.chars().count()<=1201);assert!(excerpt.ends_with('…'));}
+    #[test] fn candidate_term_coverage_is_exact(){let (matched,missing,coverage)=candidate_terms(&["alpha".into(),"beta".into()],&["alpha body"]);assert_eq!(matched,vec!["alpha"]);assert_eq!(missing,vec!["beta"]);assert_eq!(coverage,0.5);}
 }
+

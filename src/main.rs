@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solarisael_house_substrate::{process_request, AppError, Config, RememberRequest};
+use solarisael_house_substrate::{process_request, recall, AppError, Config, RecallParams, RememberRequest};
 use std::collections::BTreeSet;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
@@ -29,6 +29,12 @@ struct ProtocolRememberRequest {
     supersedes: Vec<String>,
     #[serde(default = "default_backup")]
     backup: bool,
+}
+
+#[derive(Debug)]
+enum ProtocolRequest {
+    Remember(RememberRequest),
+    Recall(RecallParams),
 }
 
 fn default_backup() -> bool { true }
@@ -84,8 +90,7 @@ fn app_error(id: String, e: AppError) -> String {
     };
     error_response(id, code, e.to_string(), retryable)
 }
-
-fn parse_request(value: Value) -> Result<RememberRequest, String> {
+fn parse_request(value: Value) -> Result<ProtocolRequest, String> {
     let request: ProtocolRememberRequest =
         serde_json::from_value(value).map_err(|e| format!("params must be a remember request: {e}"))?;
     let mut supersedes = BTreeSet::new();
@@ -99,7 +104,7 @@ fn parse_request(value: Value) -> Result<RememberRequest, String> {
         }
         supersedes.insert(id);
     }
-    Ok(RememberRequest {
+    Ok(ProtocolRequest::Remember(RememberRequest {
         room: request.room,
         kind: request.kind,
         title: request.title,
@@ -108,10 +113,16 @@ fn parse_request(value: Value) -> Result<RememberRequest, String> {
         threads: request.threads,
         supersedes: supersedes.into_iter().collect(),
         backup: request.backup,
-    })
+    }))
 }
 
-fn decode_line(line: &str) -> (String, Result<RememberRequest, String>) {
+fn parse_recall(value: Value) -> Result<ProtocolRequest, String> {
+    serde_json::from_value(value)
+        .map(ProtocolRequest::Recall)
+        .map_err(|e| format!("params must be recall parameters: {e}"))
+}
+
+fn decode_line(line: &str) -> (String, Result<ProtocolRequest, String>) {
     let parsed: Result<Envelope, _> = serde_json::from_str(line);
     let env = match parsed {
         Ok(env) => env,
@@ -127,13 +138,17 @@ fn decode_line(line: &str) -> (String, Result<RememberRequest, String>) {
     if env.protocol != Some(1) {
         return (id, Err("protocol must be 1".into()));
     }
-    if env.method.as_deref() != Some("remember") {
-        return (id, Err("method is not supported".into()));
-    }
+    let Some(method) = env.method.as_deref() else {
+        return (id, Err("method is required".into()));
+    };
     let Some(params) = env.params else {
         return (id, Err("params are required".into()));
     };
-    (id, parse_request(params))
+    match method {
+        "remember" => (id, parse_request(params)),
+        "recall" => (id, parse_recall(params)),
+        _ => (id, Err("method is not supported".into())),
+    }
 }
 
 #[tokio::main]
@@ -155,13 +170,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if trimmed.is_empty() { continue; }
         let (id, request) = decode_line(trimmed);
         let response = match request {
-            Ok(req) => match process_request(&pool, &cfg, req).await {
+            Ok(ProtocolRequest::Remember(req)) => match process_request(&pool, &cfg, req).await {
                 Ok(receipt) => serde_json::to_string(&Response {
                     protocol: 1,
                     id: id.clone(),
                     body: Body::Result { result: &receipt },
                 })?,
-                Err(e) => app_error(id, e),
+                Err(e) => app_error(id.clone(), e),
+            },
+            Ok(ProtocolRequest::Recall(params)) => match recall(&pool, &cfg, params).await {
+                Ok(result) => serde_json::to_string(&Response {
+                    protocol: 1,
+                    id: id.clone(),
+                    body: Body::Result { result: &result },
+                })?,
+                Err(e) => app_error(id.clone(), e),
             },
             Err(message) => {
                 let code = if message.starts_with("malformed request") || message.starts_with("id ") {
@@ -195,7 +218,7 @@ mod tests {
             "body": "body",
             "supersedes": ["12", "3", "12"]
         })).unwrap();
-        assert_eq!(req.supersedes, vec![3, 12]);
+        match req { ProtocolRequest::Remember(req) => assert_eq!(req.supersedes, vec![3, 12]), _ => panic!("expected remember") }
     }
 
     #[test]
@@ -205,6 +228,15 @@ mod tests {
             "supersedes": ["+1"]
         })).unwrap_err();
         assert!(err.contains("decimal"));
+    }
+
+    #[test]
+    fn recall_protocol_params_are_strict() {
+        let (id, decoded) = decode_line(r#"{"protocol":1,"id":"r1","method":"recall","params":{"room":"room","query":"needle","unexpected":true}}"#);
+        assert_eq!(id, "r1");
+        assert!(decoded.unwrap_err().contains("recall parameters"));
+        let (_, valid) = decode_line(r#"{"protocol":1,"id":"r2","method":"recall","params":{"room":"room","query":"needle"}}"#);
+        assert!(matches!(valid.unwrap(), ProtocolRequest::Recall(_)));
     }
 
     #[test]
