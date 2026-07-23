@@ -23,3 +23,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "solarisael-house-substrate"
 path = "src/main.rs"
+
+[dev-dependencies]
+house-protocol = { path = "../solarisael-house-rust/crates/house-protocol" }

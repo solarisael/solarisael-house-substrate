@@ -1,3 +1,4 @@
+use house_protocol::{ClusterMaintenanceResultWire, ResponseEnvelope};
 use solarisael_house_substrate::{process_request, Config, RememberRequest};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
@@ -52,4 +53,51 @@ async fn isolated_database_guard() {
     sqlx::query("DELETE FROM memories WHERE room=$1 AND source_path=$2")
         .bind("isolated-test").bind(source_path).execute(&pool).await.unwrap();
     pool.close().await;
+}
+
+#[test]
+fn cluster_wire_fixture_deserializes_through_shared_protocol() {
+    let fixture = r#"{
+        "protocol": 1,
+        "id": "cluster-1",
+        "result": {
+            "ok": true,
+            "operation": "check",
+            "dryRun": false,
+            "rebuilt": false,
+            "status": {
+                "stale": true,
+                "reason": "never_built",
+                "staleness": {
+                    "builtAt": null,
+                    "clusters": 0,
+                    "chunksTotal": 3,
+                    "chunksSinceBuild": 3,
+                    "fractionUnseen": 1.0
+                }
+            },
+            "clusters": [{"clusterId":1,"label":"cluster","memberCount":3,"accepted":false}]
+        }
+    }"#;
+    let response: ResponseEnvelope<ClusterMaintenanceResultWire> =
+        serde_json::from_str(fixture).expect("substrate fixture must match shared wire types");
+    let house_protocol::ResponsePayload::Result { result } = response.payload else {
+        panic!("expected result payload");
+    };
+    assert_eq!(result.status.reason, "never_built");
+    assert_eq!(result.status.staleness.chunks_since_build, 3);
+}
+
+#[test]
+fn spherical_kmeans_k1_uses_normalized_mean_centroid() {
+    let groups = solarisael_house_substrate::spherical_kmeans(
+        &[(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])],
+        1,
+    );
+    assert_eq!(groups.len(), 1);
+    let centroid = &groups[0].0;
+    let expected = 2.0_f32.sqrt().recip();
+    assert!((centroid[0] - expected).abs() < 1e-6);
+    assert!((centroid[1] - expected).abs() < 1e-6);
+    assert_eq!(groups[0].1.len(), 2);
 }

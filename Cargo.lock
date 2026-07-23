@@ -504,6 +504,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "house-core"
+version = "0.1.0"
+
+[[package]]
+name = "house-protocol"
+version = "0.1.0"
+dependencies = [
+ "house-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1474,6 +1487,7 @@ name = "solarisael-house-substrate"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "house-protocol",
  "regex",
  "reqwest",
  "serde",
