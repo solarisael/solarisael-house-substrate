@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solarisael_house_substrate::{process_request, recall, anamnesis, anamnesis_write, cluster_maintenance, AppError, Config, RecallParams, RememberRequest, AnamnesisParams, AnamnesisWrite};
+use solarisael_house_substrate::backup::{
+    backup_with_migrations, restore_checked, source_migrations,
+};
+use solarisael_house_substrate::{
+    AnamnesisParams, AnamnesisWrite, AppError, Config, RecallParams, RememberRequest, anamnesis,
+    anamnesis_write, cluster_maintenance, process_request, recall,
+};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
 
@@ -61,7 +68,9 @@ struct ClusterParams {
     #[serde(default = "default_cluster_k")]
     k: usize,
 }
-fn default_cluster_k() -> usize { 8 }
+fn default_cluster_k() -> usize {
+    8
+}
 
 #[derive(Debug)]
 enum ProtocolRequest {
@@ -72,7 +81,9 @@ enum ProtocolRequest {
     Cluster(ClusterParams),
 }
 
-fn default_backup() -> bool { true }
+fn default_backup() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize)]
 struct Response<'a, T: Serialize> {
@@ -126,13 +137,19 @@ fn app_error(id: String, e: AppError) -> String {
     error_response(id, code, e.to_string(), retryable)
 }
 fn parse_request(value: Value) -> Result<ProtocolRequest, String> {
-    let request: ProtocolRememberRequest =
-        serde_json::from_value(value).map_err(|e| format!("params must be a remember request: {e}"))?;
+    let request: ProtocolRememberRequest = serde_json::from_value(value)
+        .map_err(|e| format!("params must be a remember request: {e}"))?;
     let mut supersedes = BTreeSet::new();
     for raw in request.supersedes {
-        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) { return Err("supersedes must contain positive decimal strings".into()); }
-        let id = raw.parse::<i64>().map_err(|_| "supersedes ID is out of range".to_string())?;
-        if id <= 0 { return Err("supersedes must contain positive IDs".into()); }
+        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("supersedes must contain positive decimal strings".into());
+        }
+        let id = raw
+            .parse::<i64>()
+            .map_err(|_| "supersedes ID is out of range".to_string())?;
+        if id <= 0 {
+            return Err("supersedes must contain positive IDs".into());
+        }
         supersedes.insert(id);
     }
     Ok(ProtocolRequest::Remember(RememberRequest {
@@ -210,10 +227,69 @@ fn decode_line(line: &str) -> (String, Result<ProtocolRequest, String>) {
         _ => (id, Err("method is not supported".into())),
     }
 }
+async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let Some(command) = argv.first().cloned() else {
+        return Ok(false);
+    };
+    let args = &argv[1..];
+    let expect = |names: &[&str]| -> Result<Vec<String>, String> {
+        if args.len() != names.len() * 2 {
+            return Err("unexpected or missing arguments".into());
+        }
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            if args[i * 2] != *name {
+                return Err(format!("expected {name} VALUE"));
+            }
+            out.push(args[i * 2 + 1].clone());
+        }
+        Ok(out)
+    };
+    let cfg = Config::from_env().map_err(|e| e.to_string())?;
+    match command.as_str() {
+        "backup" => {
+            let values = expect(&["--output-dir", "--keep"]).map_err(|e| format!("backup: {e}"))?;
+            let keep = values[1]
+                .parse::<usize>()
+                .map_err(|_| "backup: --keep must be an integer".to_string())?;
+            let pool = cfg.pool().await.map_err(|e| e.to_string())?;
+            let source = source_migrations(&pool).await?;
+            let manifest = backup_with_migrations(
+                &cfg.database_url,
+                &PathBuf::from(&values[0]),
+                keep,
+                source,
+            )?;
+            println!("{}", serde_json::to_string(&manifest)?);
+        }
+        "restore" => {
+            let values = expect(&["--manifest", "--confirm-database"])
+                .map_err(|e| format!("restore: {e}"))?;
+            let pool = cfg.pool().await.map_err(|e| e.to_string())?;
+            restore_checked(
+                &pool,
+                &cfg.database_url,
+                &PathBuf::from(&values[0]),
+                &values[1],
+            )
+            .await?;
+            println!("{}", r#"{"ok":true}"#);
+        }
+        _ => return Err(format!("unknown subcommand: {command}").into()),
+    }
+    Ok(true)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter("warn").init();
+    if cli_subcommand().await? {
+        return Ok(());
+    }
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter("warn")
+        .init();
     let cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -227,7 +303,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::BufWriter::new(io::stdout());
     while let Some(line) = lines.next_line().await? {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         let (id, request) = decode_line(trimmed);
         let response = match request {
             Ok(ProtocolRequest::Remember(req)) => match process_request(&pool, &cfg, req).await {
@@ -247,19 +325,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => app_error(id.clone(), e),
             },
             Ok(ProtocolRequest::Anamnesis(params)) => match anamnesis(&pool, params).await {
-                Ok(result) => serde_json::to_string(&Response { protocol: 1, id: id.clone(), body: Body::Result { result: &result } })?,
+                Ok(result) => serde_json::to_string(&Response {
+                    protocol: 1,
+                    id: id.clone(),
+                    body: Body::Result { result: &result },
+                })?,
                 Err(e) => app_error(id.clone(), e),
             },
-            Ok(ProtocolRequest::AnamnesisWrite(req)) => match anamnesis_write(&pool, &cfg, req).await {
-                Ok(result) => serde_json::to_string(&Response { protocol: 1, id: id.clone(), body: Body::Result { result: &result } })?,
-                Err(e) => app_error(id.clone(), e),
-            },
-            Ok(ProtocolRequest::Cluster(params)) => match cluster_maintenance(&pool, &params.operation, params.dry_run, params.if_stale, params.k).await {
-                Ok(result) => serde_json::to_string(&Response { protocol: 1, id: id.clone(), body: Body::Result { result: &result } })?,
+            Ok(ProtocolRequest::AnamnesisWrite(req)) => {
+                match anamnesis_write(&pool, &cfg, req).await {
+                    Ok(result) => serde_json::to_string(&Response {
+                        protocol: 1,
+                        id: id.clone(),
+                        body: Body::Result { result: &result },
+                    })?,
+                    Err(e) => app_error(id.clone(), e),
+                }
+            }
+            Ok(ProtocolRequest::Cluster(params)) => match cluster_maintenance(
+                &pool,
+                &params.operation,
+                params.dry_run,
+                params.if_stale,
+                params.k,
+            )
+            .await
+            {
+                Ok(result) => serde_json::to_string(&Response {
+                    protocol: 1,
+                    id: id.clone(),
+                    body: Body::Result { result: &result },
+                })?,
                 Err(e) => app_error(id.clone(), e),
             },
             Err(message) => {
-                let code = if message.starts_with("malformed request") || message.starts_with("id ") {
+                let code = if message.starts_with("malformed request") || message.starts_with("id ")
+                {
                     "malformed_request"
                 } else if message == "protocol must be 1" {
                     "protocol_mismatch"
@@ -289,8 +390,12 @@ mod tests {
             "title": "title",
             "body": "body",
             "supersedes": ["12", "3", "12"]
-        })).unwrap();
-        match req { ProtocolRequest::Remember(req) => assert_eq!(req.supersedes, vec![3, 12]), _ => panic!("expected remember") }
+        }))
+        .unwrap();
+        match req {
+            ProtocolRequest::Remember(req) => assert_eq!(req.supersedes, vec![3, 12]),
+            _ => panic!("expected remember"),
+        }
     }
 
     #[test]
@@ -298,22 +403,28 @@ mod tests {
         let err = parse_request(serde_json::json!({
             "room": "room", "kind": "memory", "title": "title", "body": "body",
             "supersedes": ["+1"]
-        })).unwrap_err();
+        }))
+        .unwrap_err();
         assert!(err.contains("decimal"));
     }
 
     #[test]
     fn recall_protocol_params_are_strict() {
-        let (id, decoded) = decode_line(r#"{"protocol":1,"id":"r1","method":"recall","params":{"room":"room","query":"needle","unexpected":true}}"#);
+        let (id, decoded) = decode_line(
+            r#"{"protocol":1,"id":"r1","method":"recall","params":{"room":"room","query":"needle","unexpected":true}}"#,
+        );
         assert_eq!(id, "r1");
         assert!(decoded.unwrap_err().contains("recall parameters"));
-        let (_, valid) = decode_line(r#"{"protocol":1,"id":"r2","method":"recall","params":{"room":"room","query":"needle"}}"#);
+        let (_, valid) = decode_line(
+            r#"{"protocol":1,"id":"r2","method":"recall","params":{"room":"room","query":"needle"}}"#,
+        );
         assert!(matches!(valid.unwrap(), ProtocolRequest::Recall(_)));
     }
 
     #[test]
     fn protocol_errors_have_current_codes() {
-        let (id, result) = decode_line(r#"{"protocol":2,"id":"x","method":"remember","params":{}}"#);
+        let (id, result) =
+            decode_line(r#"{"protocol":2,"id":"x","method":"remember","params":{}}"#);
         assert_eq!(id, "x");
         assert_eq!(result.unwrap_err(), "protocol must be 1");
     }

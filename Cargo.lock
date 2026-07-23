@@ -1488,10 +1488,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "house-protocol",
+ "percent-encoding",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
