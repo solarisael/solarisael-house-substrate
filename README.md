@@ -1,22 +1,21 @@
 # Solarisael House Substrate
 
-The reproducible Rust, PostgreSQL, pgvector, and local-embedding backend for
-[Solarisael House](https://github.com/solarisael/solarisael-house). The public
-repository is
-[`solarisael/solarisael-house-substrate`](https://github.com/solarisael/solarisael-house-substrate).
+**the backend that makes House memory stick — start at the [hub](https://github.com/solarisael/solarisael-house).**
+This repository is the optional **AKASHA** backend: Rust, PostgreSQL, pgvector, and local embeddings for [Solarisael House](https://github.com/solarisael/solarisael-house).
+The public source is [`solarisael/solarisael-house-substrate`](https://github.com/solarisael/solarisael-house-substrate).
 
-This is the optional **Full House** backend. **Base House** is file-backed and
-does not require this repository. **Full House** means the release Rust
+This is the optional **AKASHA** backend. **Vault** is file-backed and
+does not require this repository. **AKASHA** means the release Rust
 executable, PostgreSQL schema, and configured embedder are all healthy.
 **Degraded** is explicit: `health.py` reports `mode: "degraded"` and exits
-non-zero; the House may continue with Base House files, but the adapter must
+non-zero; the House may continue with Vault files, but the adapter must
 surface that the substrate is unavailable.
 
 ## Public distribution contract
 
-This repository is the complete public Full House distribution. It includes the Rust runtime, migrations, `.env.example`, Python support environment, health probe, lifecycle smoke, import and maintenance tools, and Rust backup/restore authority. An installing AI must not ask the maintainer for a private substrate bundle or infer that these artifacts are absent from the Base House archive. Clone this repository beside the House core, supply local credentials, build the release executable, adapt host commands when necessary, and verify the mounted OMP lifecycle.
+This repository is the complete public AKASHA distribution. It includes the Rust runtime, migrations, `.env.example`, Python support environment, health probe, lifecycle smoke, import and maintenance tools, and Rust backup/restore authority. An installing AI must not ask the maintainer for a private substrate bundle or infer that these artifacts are absent from the Vault archive. Clone this repository beside the House core, supply local credentials, build the release executable, adapt host commands when necessary, and verify the mounted OMP lifecycle.
 
-Base and Full are deployment modes, not a required trial sequence. Choose from the operator's requested continuity and the host's verified capabilities. Additional setup work is not, by itself, a reason to recommend Base.
+Vault and AKASHA are deployment modes, not a required trial sequence. Choose from the operator's requested continuity and the host's verified capabilities. Additional setup work is not, by itself, a reason to recommend Vault.
 
 ## Supported path and prerequisites
 
@@ -167,7 +166,7 @@ Health prints one JSON object.  It exits zero only for `mode: "full"`:
 required scripts, PostgreSQL, both extensions, schema version 1, and the
 configured embedding endpoint/dimension must all pass.  For database-only
 setup diagnostics, use `python3 health.py --skip-embedding`; that is not a
-Full House check.  `--timeout SECONDS` changes the embedding probe timeout.
+AKASHA check.  `--timeout SECONDS` changes the embedding probe timeout.
 
 `record_memory.py` embeds inline by default.  Use `--no-embed` for a batch
 write, then fill missing chunks with the embedding pass:
@@ -225,7 +224,7 @@ Preview the pack before import:
 python3 import_coding_lessons.py --dry-run
 ```
 
-Import the pack after Full House health passes:
+Import the pack after AKASHA health passes:
 
 ```bash
 python3 import_coding_lessons.py
