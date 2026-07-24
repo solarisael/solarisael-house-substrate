@@ -1,20 +1,20 @@
 # Solarisael House Substrate
 
-The reproducible PostgreSQL, pgvector, and local-embedding backend for
-[Solarisael House](https://github.com/solarisael/solarisael-house).  The public
+The reproducible Rust, PostgreSQL, pgvector, and local-embedding backend for
+[Solarisael House](https://github.com/solarisael/solarisael-house). The public
 repository is
 [`solarisael/solarisael-house-substrate`](https://github.com/solarisael/solarisael-house-substrate).
 
-This is the optional **Full House** backend.  **Base House** is the
-file-backed operation and does not require this repository.  **Full House**
-means PostgreSQL, the required schema, and the configured embedder are all
-healthy.  **Degraded** is explicit: `health.py` reports `mode: "degraded"` and
-exits non-zero; the House may continue with Base House files, but the adapter
-must surface that the substrate is unavailable.
+This is the optional **Full House** backend. **Base House** is file-backed and
+does not require this repository. **Full House** means the release Rust
+executable, PostgreSQL schema, and configured embedder are all healthy.
+**Degraded** is explicit: `health.py` reports `mode: "degraded"` and exits
+non-zero; the House may continue with Base House files, but the adapter must
+surface that the substrate is unavailable.
 
 ## Public distribution contract
 
-This repository is the complete public Full House distribution. It includes the migration, `pyproject.toml`, `.env.example`, health probe, lifecycle smoke, record/query tools, and backup/restore scripts. An installing AI must not ask the maintainer for a private substrate bundle or infer that these artifacts are absent from the Base House archive. Clone this repository, supply local credentials, adapt host commands when necessary, and verify the lifecycle.
+This repository is the complete public Full House distribution. It includes the Rust runtime, migrations, `.env.example`, Python support environment, health probe, lifecycle smoke, import and maintenance tools, and Rust backup/restore authority. An installing AI must not ask the maintainer for a private substrate bundle or infer that these artifacts are absent from the Base House archive. Clone this repository beside the House core, supply local credentials, build the release executable, adapt host commands when necessary, and verify the mounted OMP lifecycle.
 
 Base and Full are deployment modes, not a required trial sequence. Choose from the operator's requested continuity and the host's verified capabilities. Additional setup work is not, by itself, a reason to recommend Base.
 
@@ -23,24 +23,34 @@ Base and Full are deployment modes, not a required trial sequence. Choose from t
 The supported integration path is:
 
 - Windows 10/11 running OMP
-- WSL 2 with Ubuntu; run every substrate Python command inside WSL
+- stable Rust with the MSVC toolchain on Windows
+- WSL 2 with Ubuntu for PostgreSQL, migrations, health, and Python support tools
 - PostgreSQL 16 with pgvector **0.7 or newer** and `pg_trgm`
 - Python 3.11+
 - Ollama with `hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest`
 
-The external commands used below are `bash`, `sudo`, `curl`, `gpg`, `git`,
-`make`, `gcc`, `psql`, `pg_dump`, `pg_restore`, `python3`, `pip`, and
-`ollama`.  `wsl.exe` is required on the Windows side for the OMP bridge.  Do
-not run long substrate writes from Windows Python across the PostgreSQL bridge.
+The mounted OMP path is:
 
-Configure the Windows OMP adapter with the Windows path:
+```text
+OMP TypeScript adapter -> Windows solarisael-house-substrate.exe -> WSL PostgreSQL and Ollama
+```
+
+The external commands used below are `cargo`, `bash`, `sudo`, `curl`, `gpg`,
+`git`, `make`, `gcc`, `psql`, `pg_dump`, `pg_restore`, `python3`, `pip`, and
+`ollama`. `wsl.exe` is required on the Windows side. Python tools remain the
+supported migration, health, import, and maintenance surface; ordinary mounted
+memory calls go through the long-lived Rust process.
+
+Configure the Windows OMP process with absolute Windows paths:
 
 ```text
 SOLARISAEL_SUBSTRATE=C:\Projects\solarisael-house-substrate
+SOLARISAEL_HOUSE_RUST=C:\Projects\solarisael-house-substrate\target\release\solarisael-house-substrate.exe
+SOLARISAEL_PG_WSL=1
 ```
 
-The adapter enters the repository through WSL.  In WSL, the same repository is
-normally `/mnt/c/Projects/solarisael-house-substrate`.
+Restart OMP after setting them. The Rust executable reads `.env` from the
+substrate repository at startup.
 
 ## Install a fresh WSL database
 
@@ -93,6 +103,20 @@ cp .env.example .env
 # Edit .env: set the database password and any non-default host/port/model.
 ```
 
+Build the authoritative Windows runtime from PowerShell or another Windows
+terminal:
+
+```text
+cd C:\Projects\solarisael-house-substrate
+cargo build --release
+```
+
+The adapter must point `SOLARISAEL_HOUSE_RUST` at:
+
+```text
+C:\Projects\solarisael-house-substrate\target\release\solarisael-house-substrate.exe
+```
+
 Install and start Ollama in WSL.  Keep `ollama serve` running in one terminal
 and use another WSL terminal for the pull and substrate commands:
 
@@ -113,6 +137,25 @@ python3 run_migrations.py
 `run_migrations.py` records applied versions in `schema_migrations`; rerunning
 it is idempotent.  The migration also creates `vector` and `pg_trgm` if they
 are not already present.
+
+## Verify the Rust runtime
+
+`health.py` verifies dependencies and schema. It does not prove that OMP is
+using the Rust transport. After health passes and OMP is restarted, use the
+registered `remember` and `recall` tools. A successful recall must report
+`source: rust-postgres`. Leave the same mounted process idle for at least 75
+seconds, then repeat the write and recall to exercise process lifetime and WSL
+keepalive behavior.
+
+The executable also owns guarded backup and restore:
+
+```text
+solarisael-house-substrate.exe backup --output-dir C:\path\to\backups --keep 14
+solarisael-house-substrate.exe restore --manifest C:\path\to\manifest.json --confirm-database solarisael_memory
+```
+
+Restore is destructive. Inspect the manifest and target database before running
+the second command.
 
 ## Health, embed, record, and wake
 
