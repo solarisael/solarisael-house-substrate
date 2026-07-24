@@ -1,12 +1,10 @@
 use house_protocol::{ClusterMaintenanceResultWire, ResponseEnvelope};
-use solarisael_house_substrate::{Config, RememberRequest, process_request};
+use solarisael_house_substrate::{Config, RememberRequest, backup::source_migrations, remember};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use uuid::Uuid;
 
-#[tokio::test]
-#[ignore = "requires SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL and an isolated PostgreSQL database"]
-async fn isolated_database_guard() {
+fn isolated_database_url() -> String {
     let url = std::env::var("SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL")
         .expect("dedicated test database URL must be configured when this proof is run");
     let lower = url.to_ascii_lowercase();
@@ -18,6 +16,28 @@ async fn isolated_database_guard() {
         !lower.contains("solarisael-house"),
         "refusing a production-looking database"
     );
+    url
+}
+
+fn migration_database_scope() -> (String, Option<String>) {
+    let Ok(schema) = std::env::var("SOLARISAEL_SUBSTRATE_TEST_SCHEMA") else {
+        return (isolated_database_url(), None);
+    };
+    assert!(schema.starts_with("solarisael_tuner_test_"));
+    assert!(
+        schema
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    );
+    let url = std::env::var("SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL")
+        .expect("the schema proof requires a PostgreSQL database URL");
+    (url, Some(schema))
+}
+
+#[tokio::test]
+#[ignore = "requires SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL and an isolated PostgreSQL database"]
+async fn isolated_database_guard() {
+    let url = isolated_database_url();
     let options = PgConnectOptions::from_str(&url).expect("dedicated test URL must be valid");
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -38,7 +58,7 @@ async fn isolated_database_guard() {
         test_embedding_disabled: true,
     };
     let source_path = format!("isolated-test/{}", Uuid::new_v4());
-    let receipt = process_request(
+    let receipt = remember(
         &pool,
         &cfg,
         RememberRequest {
@@ -79,6 +99,137 @@ async fn isolated_database_guard() {
         .execute(&pool)
         .await
         .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database or schema"]
+async fn migrations_reapply_without_clearing_current_embeddings() {
+    let (url, schema) = migration_database_scope();
+    let options = PgConnectOptions::from_str(&url).expect("test database URL must be valid");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("test database must be reachable");
+    if let Some(schema) = &schema {
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await
+            .expect("isolated schema must create");
+        sqlx::query(&format!("SET search_path TO {schema}, public"))
+            .execute(&pool)
+            .await
+            .expect("isolated schema must become active");
+    }
+    let initial = include_str!("../migrations/0001_initial.sql");
+    let nemotron = include_str!("../migrations/0002_nemotron_2048.sql");
+    sqlx::raw_sql(initial)
+        .execute(&pool)
+        .await
+        .expect("initial migration must apply");
+    sqlx::raw_sql(nemotron)
+        .execute(&pool)
+        .await
+        .expect("Nemotron migration must apply");
+
+    let source_path = format!("migration-reapply/{}", Uuid::new_v4());
+    let memory_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memories (room,type,title,source_path,body) VALUES ('isolated-test','memory','migration reapply',$1,'sentinel') RETURNING id",
+    )
+    .bind(&source_path)
+    .fetch_one(&pool)
+    .await
+    .expect("sentinel memory must insert");
+    let vector = format!("[{}]", vec!["0"; 2048].join(","));
+    sqlx::query(
+        "INSERT INTO memory_chunks (memory_id,chunk_index,body,char_start,char_end,body_embedding,embedded_at) VALUES ($1,0,'sentinel',0,8,$2::vector,NOW())",
+    )
+    .bind(memory_id)
+    .bind(vector)
+    .execute(&pool)
+    .await
+    .expect("sentinel embedding must insert");
+
+    sqlx::raw_sql(initial)
+        .execute(&pool)
+        .await
+        .expect("initial migration must reapply");
+    sqlx::raw_sql(nemotron)
+        .execute(&pool)
+        .await
+        .expect("Nemotron migration must reapply");
+    let embedded: bool = sqlx::query_scalar(
+        "SELECT body_embedding IS NOT NULL FROM memory_chunks WHERE memory_id=$1",
+    )
+    .bind(memory_id)
+    .fetch_one(&pool)
+    .await
+    .expect("sentinel embedding must remain queryable");
+    assert!(embedded);
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version IN (1,2)")
+            .fetch_one(&pool)
+            .await
+            .expect("migration versions must remain queryable");
+    assert_eq!(versions, 2);
+
+    sqlx::query("DELETE FROM memories WHERE id=$1")
+        .bind(memory_id)
+        .execute(&pool)
+        .await
+        .expect("sentinel cleanup must succeed");
+    if let Some(schema) = &schema {
+        sqlx::query("SET search_path TO public")
+            .execute(&pool)
+            .await
+            .expect("public schema must become active for cleanup");
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .expect("isolated schema cleanup must succeed");
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL schema"]
+async fn source_migrations_accepts_text_version_columns() {
+    let (url, schema) = migration_database_scope();
+    let schema = schema.expect("text-version proof requires SOLARISAEL_SUBSTRATE_TEST_SCHEMA");
+    let options = PgConnectOptions::from_str(&url).expect("test database URL must be valid");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("test database must be reachable");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("isolated schema must create");
+    sqlx::query(&format!("SET search_path TO {schema}, public"))
+        .execute(&pool)
+        .await
+        .expect("isolated schema must become active");
+    sqlx::query("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("text migration table must create");
+    sqlx::query("INSERT INTO schema_migrations(version) VALUES ('1'), ('2')")
+        .execute(&pool)
+        .await
+        .expect("text migration versions must insert");
+
+    assert_eq!(source_migrations(&pool).await.unwrap(), ["1", "2"]);
+
+    sqlx::query("SET search_path TO public")
+        .execute(&pool)
+        .await
+        .expect("public schema must become active for cleanup");
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("isolated schema cleanup must succeed");
     pool.close().await;
 }
 

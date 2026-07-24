@@ -12,7 +12,47 @@ use std::{
 };
 use uuid::Uuid;
 
-const SUPPORTED_MIGRATIONS: &[&str] = &["0001", "0002"];
+const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2"];
+const LEGACY_MIGRATIONS: &[&str] = &[
+    "0001_create_memories",
+    "0002_memory_threads_pivot",
+    "0003_named_entities",
+    "0004_coding_lessons",
+    "0005_discord_chat",
+    "0006_channel_summaries",
+    "0007_continuity_rails",
+    "0008_coding_lessons_voice_negation",
+    "0009_bot_decision_rows",
+    "0009_memories_dates_array",
+    "0010_gym_walk_ledger",
+    "0011_wake_triggers",
+    "0012_project_lessons",
+    "0013_coding_lessons_intention_alignment",
+    "0014_coding_lessons_long_running_processes",
+    "0015_coding_lessons_powershell_encoding",
+    "0016_pgvector_and_chunks_8b",
+    "0017_memory_chunks_4b",
+    "0018_coding_lessons_semantic_duplication",
+    "0019_writing_lessons",
+    "0020_anamnesis_cabinet",
+    "0021_coding_lessons_always_on",
+    "0022_memory_clusters_live_space",
+    "0023_memory_clusters_centroid",
+    "0024_memory_erasure",
+    "0025_nemotron_2048",
+];
+
+fn known_migration_lineage(versions: &[String]) -> bool {
+    [CONSOLIDATED_MIGRATIONS, LEGACY_MIGRATIONS]
+        .iter()
+        .any(|lineage| {
+            versions.len() == lineage.len()
+                && versions
+                    .iter()
+                    .zip(lineage.iter())
+                    .all(|(actual, expected)| actual == expected)
+        })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -37,19 +77,58 @@ pub struct Manifest {
     pub dump: String,
 }
 
-fn pg_bin(name: &str) -> PathBuf {
-    if let Ok(dir) = env::var("PG_BIN_DIR") {
-        return Path::new(&dir).join(if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.into()
-        });
+fn use_wsl_pg() -> bool {
+    cfg!(windows) && env::var("SOLARISAEL_PG_WSL").as_deref() == Ok("1")
+}
+
+fn pg_command(name: &str) -> Command {
+    if use_wsl_pg() {
+        let mut command = Command::new("wsl.exe");
+        let mut wslenv = env::var("WSLENV").unwrap_or_default();
+        if !wslenv.split(':').any(|entry| entry == "PGPASSWORD/u") {
+            if !wslenv.is_empty() {
+                wslenv.push(':');
+            }
+            wslenv.push_str("PGPASSWORD/u");
+        }
+        command.env("WSLENV", wslenv);
+        command.args(["--exec", name]);
+        return command;
     }
-    PathBuf::from(if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.into()
-    })
+    let executable = env::var_os("PG_BIN_DIR")
+        .map(PathBuf::from)
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            })
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            })
+        });
+    Command::new(executable)
+}
+
+fn pg_path(path: &Path) -> Result<String, BackupError> {
+    if !use_wsl_pg() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let output = Command::new("wsl.exe")
+        .args(["--exec", "wslpath", "-a"])
+        .arg(path)
+        .output()
+        .map_err(BackupError::Io)?;
+    if !output.status.success() {
+        return Err(BackupError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 fn db_parts(raw: &str) -> Result<(String, Option<String>, String), BackupError> {
     let u =
@@ -94,8 +173,8 @@ fn run(mut c: Command) -> Result<std::process::Output, BackupError> {
             }
         })
 }
-fn version(bin: &Path) -> String {
-    Command::new(bin)
+fn version(name: &str) -> String {
+    pg_command(name)
         .arg("--version")
         .output()
         .ok()
@@ -118,8 +197,11 @@ fn hash(path: &Path) -> Result<(u64, String), BackupError> {
     Ok((n, format!("{:x}", h.finalize())))
 }
 fn validate_dump(path: &Path, url: &str, password: Option<&str>) -> Result<(), BackupError> {
-    let mut c = Command::new(pg_bin("pg_restore"));
-    c.args(["--list"]).arg(path).args(["--dbname"]).arg(url);
+    let mut c = pg_command("pg_restore");
+    c.args(["--list"])
+        .arg(pg_path(path)?)
+        .args(["--dbname"])
+        .arg(url);
     if let Some(p) = password {
         c.env("PGPASSWORD", p);
     }
@@ -162,11 +244,7 @@ pub fn backup_with_migrations(
     if keep == 0 {
         return Err(BackupError::Config("keep must be at least 1".into()));
     }
-    let supported = SUPPORTED_MIGRATIONS
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>();
-    if source != supported {
+    if !known_migration_lineage(&source) {
         return Err(BackupError::Manifest(
             "database schema migrations are unsupported".into(),
         ));
@@ -177,9 +255,9 @@ pub fn backup_with_migrations(
     let dump_name = format!("{stem}.dump");
     let dump = output_dir.join(&dump_name);
     let tmp = output_dir.join(format!(".{stem}.tmp"));
-    let mut c = Command::new(pg_bin("pg_dump"));
+    let mut c = pg_command("pg_dump");
     c.args(["--format=custom", "--no-owner", "--no-acl", "--file"])
-        .arg(&tmp)
+        .arg(pg_path(&tmp)?)
         .args(["--dbname"])
         .arg(&safe);
     if let Some(p) = password.as_deref() {
@@ -202,7 +280,7 @@ pub fn backup_with_migrations(
         sha256: sha,
         format: "custom".into(),
         schema_migrations: source,
-        pg_dump_version: version(&pg_bin("pg_dump")),
+        pg_dump_version: version("pg_dump"),
         dump: dump_name,
     };
     let mp = output_dir.join(format!("{stem}.manifest.json"));
@@ -223,18 +301,18 @@ pub fn backup(database_url: &str, output_dir: &Path, keep: usize) -> Result<Mani
         database_url,
         output_dir,
         keep,
-        SUPPORTED_MIGRATIONS.iter().map(|x| x.to_string()).collect(),
+        CONSOLIDATED_MIGRATIONS
+            .iter()
+            .map(|x| x.to_string())
+            .collect(),
     )
 }
 pub async fn source_migrations(pool: &PgPool) -> Result<Vec<String>, BackupError> {
-    let rows = sqlx::query("SELECT version FROM schema_migrations ORDER BY version")
+    let rows = sqlx::query("SELECT version::text FROM schema_migrations ORDER BY version")
         .fetch_all(pool)
         .await
         .map_err(|e| BackupError::Command(format!("migration query: {e}")))?;
-    Ok(rows
-        .into_iter()
-        .map(|r| r.get::<i32, _>(0).to_string())
-        .collect())
+    Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
 }
 pub async fn restore_checked(
     pool: &PgPool,
@@ -250,12 +328,7 @@ pub async fn restore_checked(
         )));
     }
     let versions = source_migrations(pool).await?;
-    if versions
-        != SUPPORTED_MIGRATIONS
-            .iter()
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-    {
+    if !known_migration_lineage(&versions) {
         return Err(BackupError::Config(
             "schema migration versions are incompatible".into(),
         ));
@@ -271,14 +344,7 @@ pub fn restore(database_url: &str, manifest_path: &Path, confirm: &str) -> Resul
     }
     let m: Manifest = serde_json::from_slice(&fs::read(manifest_path)?)
         .map_err(|e| BackupError::Manifest(e.to_string()))?;
-    if m.database != db
-        || m.format != "custom"
-        || m.schema_migrations
-            != SUPPORTED_MIGRATIONS
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-    {
+    if m.database != db || m.format != "custom" || !known_migration_lineage(&m.schema_migrations) {
         return Err(BackupError::Manifest(
             "manifest database, format, or migrations mismatch".into(),
         ));
@@ -300,7 +366,7 @@ pub fn restore(database_url: &str, manifest_path: &Path, confirm: &str) -> Resul
         ));
     }
     validate_dump(&dump, &safe, password.as_deref())?;
-    let mut c = Command::new(pg_bin("pg_restore"));
+    let mut c = pg_command("pg_restore");
     c.args([
         "--clean",
         "--if-exists",
@@ -310,7 +376,7 @@ pub fn restore(database_url: &str, manifest_path: &Path, confirm: &str) -> Resul
         "--dbname",
     ])
     .arg(&safe)
-    .arg(&dump);
+    .arg(pg_path(&dump)?);
     if let Some(p) = password {
         c.env("PGPASSWORD", p);
     }
@@ -348,6 +414,22 @@ mod tests {
     fn query_identity_rejected() {
         assert!(db_parts("postgres://host/db?dbname=other").is_err());
     }
+    #[test]
+    fn accepts_consolidated_and_legacy_migration_lineages_only() {
+        let strings = |lineage: &[&str]| {
+            lineage
+                .iter()
+                .map(|version| version.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(known_migration_lineage(&strings(CONSOLIDATED_MIGRATIONS)));
+        assert!(known_migration_lineage(&strings(LEGACY_MIGRATIONS)));
+        let mut incomplete = strings(LEGACY_MIGRATIONS);
+        incomplete.pop();
+        assert!(!known_migration_lineage(&incomplete));
+        assert!(!known_migration_lineage(&["0001".into(), "0002".into()]));
+    }
+
     #[test]
     fn keep_rejects_zero() {
         assert!(backup("postgres://host/db", Path::new("target/nope"), 0).is_err());

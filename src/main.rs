@@ -1,76 +1,27 @@
-use serde::{Deserialize, Serialize};
+use chrono::NaiveDate;
+use house_core::{
+    AnamnesisAddRequest as DomainAnamnesisAddRequest,
+    AnamnesisAppendRequest as DomainAnamnesisAppendRequest,
+    AnamnesisReadRequest as DomainAnamnesisReadRequest,
+    ClusterMaintenanceRequest as DomainClusterMaintenanceRequest,
+    RecallRequest as DomainRecallRequest, RememberRequest as DomainRememberRequest,
+};
+use house_protocol::{
+    PROTOCOL_VERSION, ProtocolError, ProtocolErrorBody, RequestEnvelope, ResponseEnvelope,
+    ResponsePayload, success,
+};
+use serde::Serialize;
 use serde_json::Value;
 use solarisael_house_substrate::backup::{
     backup_with_migrations, restore_checked, source_migrations,
 };
 use solarisael_house_substrate::{
-    AnamnesisParams, AnamnesisWrite, AppError, Config, RecallParams, RememberRequest, anamnesis,
-    anamnesis_write, cluster_maintenance, process_request, recall,
+    AnamnesisParams, AnamnesisSeed, AnamnesisWrite, AppError, Config, RecallParams,
+    RememberRequest, anamnesis, anamnesis_write, cluster_maintenance, recall, remember,
 };
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope {
-    protocol: Option<u64>,
-    id: Option<String>,
-    method: Option<String>,
-    params: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProtocolRememberRequest {
-    room: String,
-    kind: String,
-    title: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    lesson: Option<String>,
-    #[serde(default)]
-    source_path: Option<String>,
-    #[serde(default)]
-    source_memory_path: Option<String>,
-    #[serde(default)]
-    threads: Vec<String>,
-    #[serde(default)]
-    supersedes: Vec<String>,
-    #[serde(default)]
-    shape: Option<String>,
-    #[serde(default)]
-    voice: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    project: Option<String>,
-    #[serde(default, alias = "proofPattern")]
-    proof_pattern: Option<String>,
-    #[serde(default, alias = "triggerContext")]
-    trigger_context: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default = "default_backup")]
-    backup: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClusterParams {
-    operation: String,
-    #[serde(rename = "dryRun", default)]
-    dry_run: bool,
-    #[serde(rename = "ifStale", default)]
-    if_stale: bool,
-    #[serde(default = "default_cluster_k")]
-    k: usize,
-}
-fn default_cluster_k() -> usize {
-    8
-}
 
 #[derive(Debug)]
 enum ProtocolRequest {
@@ -78,55 +29,221 @@ enum ProtocolRequest {
     Recall(RecallParams),
     Anamnesis(AnamnesisParams),
     AnamnesisWrite(AnamnesisWrite),
-    Cluster(ClusterParams),
+    Cluster(DomainClusterMaintenanceRequest),
 }
 
-fn default_backup() -> bool {
-    true
+fn invalid_params(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::InvalidParams(message.into())
 }
 
-#[derive(Debug, Serialize)]
-struct Response<'a, T: Serialize> {
-    protocol: u64,
-    id: String,
-    #[serde(flatten)]
-    body: Body<'a, T>,
+fn positive_i64(value: u64, field: &str) -> Result<i64, ProtocolError> {
+    i64::try_from(value)
+        .map_err(|_| invalid_params(format!("{field} is out of PostgreSQL BIGINT range")))
 }
 
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum Body<'a, T: Serialize> {
-    Result { result: &'a T },
-    Error { error: ErrorBody },
+fn positive_i32(value: u32, field: &str) -> Result<i32, ProtocolError> {
+    i32::try_from(value)
+        .map_err(|_| invalid_params(format!("{field} is out of PostgreSQL INTEGER range")))
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    code: String,
-    message: String,
-    retryable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<Value>,
+fn optional_date(value: Option<&str>, field: &str) -> Result<Option<NaiveDate>, ProtocolError> {
+    value
+        .map(|raw| {
+            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .map_err(|_| invalid_params(format!("{field} must use YYYY-MM-DD")))
+        })
+        .transpose()
 }
 
-fn error_response(id: String, code: &str, message: impl Into<String>, retryable: bool) -> String {
-    serde_json::to_string(&Response::<Value> {
-        protocol: 1,
-        id,
-        body: Body::Error {
-            error: ErrorBody {
-                code: code.into(),
-                message: message.into(),
-                retryable,
-                details: None,
-            },
-        },
+fn remember_service_request(
+    request: DomainRememberRequest,
+) -> Result<RememberRequest, ProtocolError> {
+    let supersedes = request
+        .supersedes()
+        .iter()
+        .map(|&id| positive_i64(id, "supersedes ID"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RememberRequest {
+        room: request.room().to_string(),
+        kind: request.kind().as_str().into(),
+        title: request.title().into(),
+        body: request.body().into(),
+        lesson: None,
+        source_path: request.source_path().map(str::to_owned),
+        source_memory_path: None,
+        threads: request.threads().to_vec(),
+        supersedes,
+        shape: request.shape().map(str::to_owned),
+        voice: request.voice().map(str::to_owned),
+        scope: request.scope().map(str::to_owned),
+        project: request.project().map(str::to_owned),
+        proof_pattern: request.proof_pattern().map(str::to_owned),
+        trigger_context: request.trigger_context().map(str::to_owned),
+        tags: request.tags().to_vec(),
+        backup: request.backup(),
     })
-    .expect("response serialization cannot fail")
 }
 
-fn app_error(id: String, e: AppError) -> String {
-    let (code, retryable) = match &e {
+fn recall_service_request(request: DomainRecallRequest) -> RecallParams {
+    RecallParams {
+        room: request.room().to_string(),
+        query: request.query().into(),
+        semantic_top_k: request.semantic_top_k(),
+        semantic_min_similarity: request.semantic_min_similarity(),
+        content_top_k: request.content_top_k(),
+        content_min_similarity: request.content_min_similarity(),
+    }
+}
+
+fn anamnesis_service_request(request: DomainAnamnesisReadRequest) -> AnamnesisParams {
+    AnamnesisParams {
+        room: request.room().to_string(),
+        mode: request.mode().as_str().into(),
+        query: request.query().unwrap_or_default().into(),
+        limit: Some(request.limit()),
+    }
+}
+
+fn anamnesis_add_service_request(
+    request: DomainAnamnesisAddRequest,
+) -> Result<AnamnesisWrite, ProtocolError> {
+    let seed_rep = request
+        .seed_rep()
+        .map(|seed| {
+            Ok(AnamnesisSeed {
+                number: positive_i32(seed.number(), "seedRep.number")?,
+                occurred_on: optional_date(seed.occurred_on(), "seedRep.occurredOn")?,
+                how_it_went: seed.how_it_went().into(),
+                portal_pull: seed.portal_pull().into(),
+                lighter: seed.lighter().into(),
+                source_path: None,
+            })
+        })
+        .transpose()?;
+    Ok(AnamnesisWrite {
+        room: request.room().to_string(),
+        operation: "add".into(),
+        kind: Some(request.kind().as_str().into()),
+        fidelity: Some(request.fidelity().as_str().into()),
+        activation: Some(request.activation().as_str().into()),
+        dormant: request.dormant(),
+        title: request.title().into(),
+        shape: request.shape().map(str::to_owned),
+        ramp: Some(request.ramp().into()),
+        counsel: request.counsel().map(str::to_owned),
+        peak: request.peak().map(str::to_owned),
+        beginning: request.beginning().map(str::to_owned),
+        verify_note: request.verify_note().map(str::to_owned),
+        source_paths: request.source_paths().to_vec(),
+        canon_links: request.canon().to_vec(),
+        tags: request.tags().to_vec(),
+        allow_empty_cycle: request.allow_empty_cycle(),
+        seed_rep,
+        backup: true,
+        rep_number: None,
+        occurred_on: None,
+        how_it_went: None,
+        portal_pull: None,
+        lighter: None,
+    })
+}
+
+fn anamnesis_append_service_request(
+    request: DomainAnamnesisAppendRequest,
+) -> Result<AnamnesisWrite, ProtocolError> {
+    Ok(AnamnesisWrite {
+        room: request.room().to_string(),
+        operation: "append-rep".into(),
+        kind: None,
+        fidelity: None,
+        activation: None,
+        dormant: false,
+        title: request.title().into(),
+        shape: None,
+        ramp: None,
+        counsel: None,
+        peak: None,
+        beginning: None,
+        verify_note: None,
+        source_paths: request.source_paths().to_vec(),
+        canon_links: Vec::new(),
+        tags: Vec::new(),
+        allow_empty_cycle: false,
+        seed_rep: None,
+        backup: true,
+        rep_number: Some(positive_i32(request.rep_number(), "repNumber")?),
+        occurred_on: optional_date(request.occurred_on(), "occurredOn")?,
+        how_it_went: Some(request.how_it_went().into()),
+        portal_pull: Some(request.portal_pull().into()),
+        lighter: Some(request.lighter().into()),
+    })
+}
+
+fn decode_line(line: &str) -> (String, Result<ProtocolRequest, ProtocolError>) {
+    let envelope = match RequestEnvelope::parse_line(line) {
+        Ok(envelope) => envelope,
+        Err(error) => return ("unknown".into(), Err(error)),
+    };
+    let id = envelope.id.clone();
+    if id.trim().is_empty() {
+        return (
+            id,
+            Err(ProtocolError::Malformed("id must be non-empty".into())),
+        );
+    }
+    if envelope.protocol != PROTOCOL_VERSION {
+        return (id, Err(ProtocolError::ProtocolMismatch(envelope.protocol)));
+    }
+    let request = match envelope.method.as_str() {
+        "remember" => envelope
+            .remember_request()
+            .and_then(remember_service_request)
+            .map(ProtocolRequest::Remember),
+        "recall" => envelope
+            .recall_request()
+            .map(recall_service_request)
+            .map(ProtocolRequest::Recall),
+        "anamnesis" => envelope
+            .anamnesis_request()
+            .map(anamnesis_service_request)
+            .map(ProtocolRequest::Anamnesis),
+        "anamnesis_write" => match envelope.params.get("operation").and_then(Value::as_str) {
+            Some("add") => envelope
+                .anamnesis_add_request()
+                .and_then(anamnesis_add_service_request)
+                .map(ProtocolRequest::AnamnesisWrite),
+            Some("append-rep") => envelope
+                .anamnesis_append_request()
+                .and_then(anamnesis_append_service_request)
+                .map(ProtocolRequest::AnamnesisWrite),
+            Some(operation) => Err(invalid_params(format!(
+                "unsupported anamnesis_write operation: {operation}"
+            ))),
+            None => Err(invalid_params("anamnesis_write requires operation")),
+        },
+        "cluster_maintenance" => envelope
+            .cluster_maintenance_request()
+            .map(ProtocolRequest::Cluster),
+        method => Err(ProtocolError::UnknownMethod(method.into())),
+    };
+    (id, request)
+}
+
+fn error_json(id: String, error: ProtocolErrorBody) -> String {
+    serde_json::to_string(&ResponseEnvelope::<Value> {
+        protocol: PROTOCOL_VERSION,
+        id,
+        payload: ResponsePayload::Error { error },
+    })
+    .expect("protocol error serialization cannot fail")
+}
+
+fn protocol_error(id: String, error: ProtocolError) -> String {
+    error_json(id, error.into())
+}
+
+fn app_error(id: String, error: AppError) -> String {
+    let (code, retryable) = match &error {
         AppError::Invalid(_) => ("invalid_params", false),
         AppError::Config(_) => ("configuration", false),
         AppError::Protocol(_) => ("protocol", false),
@@ -134,99 +251,21 @@ fn app_error(id: String, e: AppError) -> String {
         AppError::Database(_) => ("database", true),
         AppError::Io(_) => ("io", true),
     };
-    error_response(id, code, e.to_string(), retryable)
-}
-fn parse_request(value: Value) -> Result<ProtocolRequest, String> {
-    let request: ProtocolRememberRequest = serde_json::from_value(value)
-        .map_err(|e| format!("params must be a remember request: {e}"))?;
-    let mut supersedes = BTreeSet::new();
-    for raw in request.supersedes {
-        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-            return Err("supersedes must contain positive decimal strings".into());
-        }
-        let id = raw
-            .parse::<i64>()
-            .map_err(|_| "supersedes ID is out of range".to_string())?;
-        if id <= 0 {
-            return Err("supersedes must contain positive IDs".into());
-        }
-        supersedes.insert(id);
-    }
-    Ok(ProtocolRequest::Remember(RememberRequest {
-        room: request.room,
-        kind: request.kind,
-        title: request.title,
-        body: request.body,
-        lesson: request.lesson,
-        source_path: request.source_path,
-        source_memory_path: request.source_memory_path,
-        threads: request.threads,
-        supersedes: supersedes.into_iter().collect(),
-        shape: request.shape,
-        voice: request.voice,
-        scope: request.scope,
-        project: request.project,
-        proof_pattern: request.proof_pattern,
-        trigger_context: request.trigger_context,
-        tags: request.tags,
-        backup: request.backup,
-    }))
+    error_json(
+        id,
+        ProtocolErrorBody {
+            code: code.into(),
+            message: error.to_string(),
+            retryable,
+            details: None,
+        },
+    )
 }
 
-fn parse_recall(value: Value) -> Result<ProtocolRequest, String> {
-    serde_json::from_value(value)
-        .map(ProtocolRequest::Recall)
-        .map_err(|e| format!("params must be recall parameters: {e}"))
+fn success_json<T: Serialize>(id: String, result: T) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&success(id, result))
 }
 
-fn parse_anamnesis(value: Value) -> Result<ProtocolRequest, String> {
-    serde_json::from_value(value)
-        .map(ProtocolRequest::Anamnesis)
-        .map_err(|e| format!("params must be anamnesis parameters: {e}"))
-}
-
-fn parse_anamnesis_write(value: Value) -> Result<ProtocolRequest, String> {
-    serde_json::from_value(value)
-        .map(ProtocolRequest::AnamnesisWrite)
-        .map_err(|e| format!("params must be anamnesis_write parameters: {e}"))
-}
-fn parse_cluster(value: Value) -> Result<ProtocolRequest, String> {
-    serde_json::from_value(value)
-        .map(ProtocolRequest::Cluster)
-        .map_err(|e| format!("params must be cluster_maintenance parameters: {e}"))
-}
-
-fn decode_line(line: &str) -> (String, Result<ProtocolRequest, String>) {
-    let parsed: Result<Envelope, _> = serde_json::from_str(line);
-    let env = match parsed {
-        Ok(env) => env,
-        Err(e) => return ("unknown".into(), Err(format!("malformed request: {e}"))),
-    };
-    let Some(raw_id) = env.id.clone() else {
-        return ("unknown".into(), Err("id is required".into()));
-    };
-    let id = raw_id;
-    if id.trim().is_empty() {
-        return (id, Err("id must be non-empty".into()));
-    }
-    if env.protocol != Some(1) {
-        return (id, Err("protocol must be 1".into()));
-    }
-    let Some(method) = env.method.as_deref() else {
-        return (id, Err("method is required".into()));
-    };
-    let Some(params) = env.params else {
-        return (id, Err("params are required".into()));
-    };
-    match method {
-        "remember" => (id, parse_request(params)),
-        "recall" => (id, parse_recall(params)),
-        "anamnesis" => (id, parse_anamnesis(params)),
-        "anamnesis_write" => (id, parse_anamnesis_write(params)),
-        "cluster_maintenance" => (id, parse_cluster(params)),
-        _ => (id, Err("method is not supported".into())),
-    }
-}
 async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = argv.first().cloned() else {
@@ -238,25 +277,26 @@ async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
             return Err("unexpected or missing arguments".into());
         }
         let mut out = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
-            if args[i * 2] != *name {
+        for (index, name) in names.iter().enumerate() {
+            if args[index * 2] != *name {
                 return Err(format!("expected {name} VALUE"));
             }
-            out.push(args[i * 2 + 1].clone());
+            out.push(args[index * 2 + 1].clone());
         }
         Ok(out)
     };
-    let cfg = Config::from_env().map_err(|e| e.to_string())?;
+    let config = Config::from_env().map_err(|error| error.to_string())?;
     match command.as_str() {
         "backup" => {
-            let values = expect(&["--output-dir", "--keep"]).map_err(|e| format!("backup: {e}"))?;
+            let values =
+                expect(&["--output-dir", "--keep"]).map_err(|error| format!("backup: {error}"))?;
             let keep = values[1]
                 .parse::<usize>()
                 .map_err(|_| "backup: --keep must be an integer".to_string())?;
-            let pool = cfg.pool().await.map_err(|e| e.to_string())?;
+            let pool = config.pool().await.map_err(|error| error.to_string())?;
             let source = source_migrations(&pool).await?;
             let manifest = backup_with_migrations(
-                &cfg.database_url,
+                &config.database_url,
                 &PathBuf::from(&values[0]),
                 keep,
                 source,
@@ -265,16 +305,16 @@ async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
         }
         "restore" => {
             let values = expect(&["--manifest", "--confirm-database"])
-                .map_err(|e| format!("restore: {e}"))?;
-            let pool = cfg.pool().await.map_err(|e| e.to_string())?;
+                .map_err(|error| format!("restore: {error}"))?;
+            let pool = config.pool().await.map_err(|error| error.to_string())?;
             restore_checked(
                 &pool,
-                &cfg.database_url,
+                &config.database_url,
                 &PathBuf::from(&values[0]),
                 &values[1],
             )
             .await?;
-            println!("{}", r#"{"ok":true}"#);
+            println!("{{\"ok\":true}}");
         }
         _ => return Err(format!("unknown subcommand: {command}").into()),
     }
@@ -290,14 +330,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .with_env_filter("warn")
         .init();
-    let cfg = match Config::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("configuration failed: {e}");
-            return Err(e.into());
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            error!("configuration failed: {error}");
+            return Err(error.into());
         }
     };
-    let pool = cfg.pool().await?;
+    let pool = config.pool().await?;
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::BufWriter::new(io::stdout());
@@ -308,71 +348,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (id, request) = decode_line(trimmed);
         let response = match request {
-            Ok(ProtocolRequest::Remember(req)) => match process_request(&pool, &cfg, req).await {
-                Ok(receipt) => serde_json::to_string(&Response {
-                    protocol: 1,
-                    id: id.clone(),
-                    body: Body::Result { result: &receipt },
-                })?,
-                Err(e) => app_error(id.clone(), e),
-            },
-            Ok(ProtocolRequest::Recall(params)) => match recall(&pool, &cfg, params).await {
-                Ok(result) => serde_json::to_string(&Response {
-                    protocol: 1,
-                    id: id.clone(),
-                    body: Body::Result { result: &result },
-                })?,
-                Err(e) => app_error(id.clone(), e),
-            },
-            Ok(ProtocolRequest::Anamnesis(params)) => match anamnesis(&pool, params).await {
-                Ok(result) => serde_json::to_string(&Response {
-                    protocol: 1,
-                    id: id.clone(),
-                    body: Body::Result { result: &result },
-                })?,
-                Err(e) => app_error(id.clone(), e),
-            },
-            Ok(ProtocolRequest::AnamnesisWrite(req)) => {
-                match anamnesis_write(&pool, &cfg, req).await {
-                    Ok(result) => serde_json::to_string(&Response {
-                        protocol: 1,
-                        id: id.clone(),
-                        body: Body::Result { result: &result },
-                    })?,
-                    Err(e) => app_error(id.clone(), e),
+            Ok(ProtocolRequest::Remember(request)) => {
+                match remember(&pool, &config, request).await {
+                    Ok(result) => success_json(id, result)?,
+                    Err(error) => app_error(id, error),
                 }
             }
-            Ok(ProtocolRequest::Cluster(params)) => match cluster_maintenance(
-                &pool,
-                &params.operation,
-                params.dry_run,
-                params.if_stale,
-                params.k,
-            )
-            .await
-            {
-                Ok(result) => serde_json::to_string(&Response {
-                    protocol: 1,
-                    id: id.clone(),
-                    body: Body::Result { result: &result },
-                })?,
-                Err(e) => app_error(id.clone(), e),
+            Ok(ProtocolRequest::Recall(request)) => match recall(&pool, &config, request).await {
+                Ok(result) => success_json(id, result)?,
+                Err(error) => app_error(id, error),
             },
-            Err(message) => {
-                let code = if message.starts_with("malformed request") || message.starts_with("id ")
-                {
-                    "malformed_request"
-                } else if message == "protocol must be 1" {
-                    "protocol_mismatch"
-                } else if message == "method is not supported" {
-                    "unknown_method"
-                } else {
-                    "invalid_params"
-                };
-                error_response(id, code, message, false)
+            Ok(ProtocolRequest::Anamnesis(request)) => match anamnesis(&pool, request).await {
+                Ok(result) => success_json(id, result)?,
+                Err(error) => app_error(id, error),
+            },
+            Ok(ProtocolRequest::AnamnesisWrite(request)) => {
+                match anamnesis_write(&pool, &config, request).await {
+                    Ok(result) => success_json(id, result)?,
+                    Err(error) => app_error(id, error),
+                }
             }
+            Ok(ProtocolRequest::Cluster(request)) => {
+                match cluster_maintenance(
+                    &pool,
+                    request.operation().as_str(),
+                    request.dry_run(),
+                    request.if_stale(),
+                    request.k() as usize,
+                )
+                .await
+                {
+                    Ok(result) => success_json(id, result)?,
+                    Err(error) => app_error(id, error),
+                }
+            }
+            Err(error) => protocol_error(id, error),
         };
-        stdout.write_all(format!("{response}\n").as_bytes()).await?;
+        stdout.write_all(response.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
         stdout.flush().await?;
     }
     Ok(())
@@ -384,28 +397,21 @@ mod tests {
 
     #[test]
     fn adapter_supersedes_strings_are_positive_and_deduplicated() {
-        let req = parse_request(serde_json::json!({
-            "room": "room",
-            "kind": "memory",
-            "title": "title",
-            "body": "body",
-            "supersedes": ["12", "3", "12"]
-        }))
-        .unwrap();
-        match req {
-            ProtocolRequest::Remember(req) => assert_eq!(req.supersedes, vec![3, 12]),
+        let (_, request) = decode_line(
+            r#"{"protocol":1,"id":"r1","method":"remember","params":{"room":"room","kind":"memory","title":"title","body":"body","supersedes":["12","3","12"]}}"#,
+        );
+        match request.unwrap() {
+            ProtocolRequest::Remember(request) => assert_eq!(request.supersedes, vec![12, 3]),
             _ => panic!("expected remember"),
         }
     }
 
     #[test]
     fn rejects_non_decimal_supersedes() {
-        let err = parse_request(serde_json::json!({
-            "room": "room", "kind": "memory", "title": "title", "body": "body",
-            "supersedes": ["+1"]
-        }))
-        .unwrap_err();
-        assert!(err.contains("decimal"));
+        let (_, request) = decode_line(
+            r#"{"protocol":1,"id":"r1","method":"remember","params":{"room":"room","kind":"memory","title":"title","body":"body","supersedes":["+1"]}}"#,
+        );
+        assert!(request.unwrap_err().to_string().contains("positive"));
     }
 
     #[test]
@@ -414,7 +420,7 @@ mod tests {
             r#"{"protocol":1,"id":"r1","method":"recall","params":{"room":"room","query":"needle","unexpected":true}}"#,
         );
         assert_eq!(id, "r1");
-        assert!(decoded.unwrap_err().contains("recall parameters"));
+        assert!(matches!(decoded, Err(ProtocolError::InvalidParams(_))));
         let (_, valid) = decode_line(
             r#"{"protocol":1,"id":"r2","method":"recall","params":{"room":"room","query":"needle"}}"#,
         );
@@ -426,6 +432,20 @@ mod tests {
         let (id, result) =
             decode_line(r#"{"protocol":2,"id":"x","method":"remember","params":{}}"#);
         assert_eq!(id, "x");
-        assert_eq!(result.unwrap_err(), "protocol must be 1");
+        assert_eq!(result.unwrap_err(), ProtocolError::ProtocolMismatch(2));
+    }
+
+    #[test]
+    fn anamnesis_append_uses_shared_domain_validation() {
+        let (_, request) = decode_line(
+            r#"{"protocol":1,"id":"a1","method":"anamnesis_write","params":{"operation":"append-rep","room":"tuner","title":"cycle","repNumber":1,"occurredOn":"2026-07-23","howItWent":"clean","portalPull":"none","lighter":"yes","sourcePaths":["memory/a.md"]}}"#,
+        );
+        match request.unwrap() {
+            ProtocolRequest::AnamnesisWrite(request) => {
+                assert_eq!(request.operation, "append-rep");
+                assert_eq!(request.rep_number, Some(1));
+            }
+            _ => panic!("expected anamnesis write"),
+        }
     }
 }

@@ -1487,6 +1487,7 @@ name = "solarisael-house-substrate"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "house-core",
  "house-protocol",
  "percent-encoding",
  "regex",
