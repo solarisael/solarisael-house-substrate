@@ -25,7 +25,6 @@ use std::{
     process::{Child, Command, Stdio},
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::error;
 
 #[derive(Debug)]
 enum ProtocolRequest {
@@ -246,24 +245,8 @@ fn protocol_error(id: String, error: ProtocolError) -> String {
     error_json(id, error.into())
 }
 
-fn app_error(id: String, error: AppError) -> String {
-    let (code, retryable) = match &error {
-        AppError::Invalid(_) => ("invalid_params", false),
-        AppError::Config(_) => ("configuration", false),
-        AppError::Protocol(_) => ("protocol", false),
-        AppError::Embedding(_) => ("embedding", true),
-        AppError::Database(_) => ("database", true),
-        AppError::Io(_) => ("io", true),
-    };
-    error_json(
-        id,
-        ProtocolErrorBody {
-            code: code.into(),
-            message: error.to_string(),
-            retryable,
-            details: None,
-        },
-    )
+fn app_error(id: String, operation: &str, error: AppError) -> String {
+    error_json(id, error.protocol_error_body(operation))
 }
 
 fn success_json<T: Serialize>(id: String, result: T) -> Result<String, serde_json::Error> {
@@ -391,14 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .with_env_filter("warn")
         .init();
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            error!("configuration failed: {error}");
-            return Err(error.into());
-        }
-    };
-    let pool = config.pool().await?;
+    let mut runtime = None;
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::BufWriter::new(io::stdout());
@@ -409,38 +385,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (id, request) = decode_line(trimmed);
         let response = match request {
-            Ok(ProtocolRequest::Remember(request)) => {
-                match remember(&pool, &config, request).await {
-                    Ok(result) => success_json(id, result)?,
-                    Err(error) => app_error(id, error),
-                }
-            }
-            Ok(ProtocolRequest::Recall(request)) => match recall(&pool, &config, request).await {
-                Ok(result) => success_json(id, result)?,
-                Err(error) => app_error(id, error),
-            },
-            Ok(ProtocolRequest::Anamnesis(request)) => match anamnesis(&pool, request).await {
-                Ok(result) => success_json(id, result)?,
-                Err(error) => app_error(id, error),
-            },
-            Ok(ProtocolRequest::AnamnesisWrite(request)) => {
-                match anamnesis_write(&pool, &config, request).await {
-                    Ok(result) => success_json(id, result)?,
-                    Err(error) => app_error(id, error),
-                }
-            }
-            Ok(ProtocolRequest::Cluster(request)) => {
-                match cluster_maintenance(
-                    &pool,
-                    request.operation().as_str(),
-                    request.dry_run(),
-                    request.if_stale(),
-                    request.k() as usize,
-                )
-                .await
-                {
-                    Ok(result) => success_json(id, result)?,
-                    Err(error) => app_error(id, error),
+            Ok(request) => {
+                let operation = match &request {
+                    ProtocolRequest::Remember(_) => "remember",
+                    ProtocolRequest::Recall(_) => "recall",
+                    ProtocolRequest::Anamnesis(_) => "anamnesis",
+                    ProtocolRequest::AnamnesisWrite(_) => "anamnesis_write",
+                    ProtocolRequest::Cluster(_) => "cluster_maintenance",
+                };
+                let validation = match &request {
+                    ProtocolRequest::Remember(request) => request.validate(),
+                    ProtocolRequest::Recall(request) => request.validate(),
+                    ProtocolRequest::Anamnesis(request) => request.validate().map(|_| ()),
+                    ProtocolRequest::AnamnesisWrite(_) | ProtocolRequest::Cluster(_) => Ok(()),
+                };
+                if let Err(error) = validation {
+                    app_error(id, operation, error)
+                } else {
+                    let initialization_error = if runtime.is_none() {
+                        match Config::from_env() {
+                            Ok(config) => match config.pool().await {
+                                Ok(pool) => {
+                                    runtime = Some((config, pool));
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            },
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(error) = initialization_error {
+                        app_error(id, operation, error)
+                    } else {
+                        let (config, pool) = runtime
+                            .as_ref()
+                            .expect("successful initialization stores the runtime");
+                        match request {
+                            ProtocolRequest::Remember(request) => {
+                                match remember(pool, config, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::Recall(request) => {
+                                match recall(pool, config, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::Anamnesis(request) => {
+                                match anamnesis(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::AnamnesisWrite(request) => {
+                                match anamnesis_write(pool, config, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::Cluster(request) => {
+                                match cluster_maintenance(
+                                    pool,
+                                    request.operation().as_str(),
+                                    request.dry_run(),
+                                    request.if_stale(),
+                                    request.k() as usize,
+                                )
+                                .await
+                                {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => protocol_error(id, error),

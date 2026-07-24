@@ -1,3 +1,8 @@
+use house_protocol::{
+    DiagnosticCategory, DiagnosticDetails, DiagnosticEvidence, DiagnosticExecution,
+    DiagnosticNextCheck, DiagnosticOwner, DiagnosticRetry, DiagnosticStage, DiagnosticTarget,
+    DiagnosticTargetKind, DiagnosticWriteOutcome,
+};
 use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use reqwest::Url;
@@ -65,6 +70,88 @@ pub enum BackupError {
     #[error("backup manifest: {0}")]
     Manifest(String),
 }
+impl BackupError {
+    pub fn diagnostics(&self, operation: &str) -> DiagnosticDetails {
+        let (failure, retry, write_outcome, target) = match self {
+            Self::Config(_) => (
+                "configuration_invalid",
+                DiagnosticRetry::AfterChange,
+                DiagnosticWriteOutcome::NotStarted,
+                DiagnosticTarget::new(DiagnosticTargetKind::File, "src/backup.rs"),
+            ),
+            Self::Io(error) => (
+                "filesystem_error",
+                DiagnosticRetry::ReconcileFirst,
+                DiagnosticWriteOutcome::Unknown,
+                DiagnosticTarget::new(DiagnosticTargetKind::File, "backup output directory"),
+            ),
+            Self::Command(_) => (
+                "postgres_command_failed",
+                DiagnosticRetry::ReconcileFirst,
+                DiagnosticWriteOutcome::Unknown,
+                DiagnosticTarget::new(DiagnosticTargetKind::Service, "pg_dump or pg_restore"),
+            ),
+            Self::Manifest(_) => (
+                "manifest_invalid",
+                DiagnosticRetry::AfterChange,
+                DiagnosticWriteOutcome::NotStarted,
+                DiagnosticTarget::new(DiagnosticTargetKind::File, "backup manifest"),
+            ),
+        };
+        let observed = match self {
+            Self::Io(error) => serde_json::json!({
+                "failure": failure,
+                "io_error_kind": error.kind().to_string(),
+            }),
+            _ => serde_json::json!({"failure": failure}),
+        };
+        DiagnosticDetails::new(DiagnosticCategory::Backup, DiagnosticStage::Backup)
+            .operation(operation)
+            .owner(
+                DiagnosticOwner::new("solarisael-house-substrate")
+                    .path("src/backup.rs")
+                    .symbol(match operation {
+                        "restore" => "restore_checked",
+                        _ => "backup_with_migrations",
+                    }),
+            )
+            .expected(match operation {
+                "restore" => serde_json::json!({
+                    "restore": "validated manifest and confirmed target database",
+                }),
+                _ => serde_json::json!({
+                    "backup": "durable custom-format dump and manifest",
+                }),
+            })
+            .observed(observed.clone())
+            .evidence(
+                DiagnosticEvidence::new("backup_failure")
+                    .summary("Backup diagnostics omit command stderr, database URLs, and passwords")
+                    .data(observed),
+            )
+            .target(DiagnosticTarget::new(DiagnosticTargetKind::File, "src/backup.rs"))
+            .target(target.clone())
+            .next_check(
+                DiagnosticNextCheck::new("inspect_backup_target")
+                    .target(target)
+                    .expected(serde_json::json!({"failure_resolved": failure})),
+            )
+            .next_check(
+                DiagnosticNextCheck::new(if retry == DiagnosticRetry::ReconcileFirst {
+                    "reconcile_backup_or_restore"
+                } else {
+                    "retry_backup_or_restore"
+                })
+                .expected(serde_json::json!({"safe_retry": retry == DiagnosticRetry::SafeNow})),
+            )
+            .execution(DiagnosticExecution::new(
+                operation == "restore",
+                write_outcome,
+                retry,
+            ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub database: String,

@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde", "clock"] }
-house-core = { path = "../solarisael-house-rust/crates/house-core" }
-house-protocol = { path = "../solarisael-house-rust/crates/house-protocol" }
+house-core = { path = "../the-athanor/crates/house-core" }
+house-protocol = { path = "../the-athanor/crates/house-protocol" }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 percent-encoding = "2"
