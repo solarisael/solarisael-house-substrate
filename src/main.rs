@@ -19,7 +19,11 @@ use solarisael_house_substrate::{
     AnamnesisParams, AnamnesisSeed, AnamnesisWrite, AppError, Config, RecallParams,
     RememberRequest, anamnesis, anamnesis_write, cluster_maintenance, recall, remember,
 };
-use std::path::PathBuf;
+use std::{
+    env,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
 
@@ -321,11 +325,38 @@ async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(true)
 }
 
+struct WslKeepalive(Option<Child>);
+
+impl WslKeepalive {
+    fn start() -> Result<Self, std::io::Error> {
+        if !cfg!(windows) || env::var("SOLARISAEL_PG_WSL").as_deref() != Ok("1") {
+            return Ok(Self(None));
+        }
+        let child = Command::new("wsl.exe")
+            .args(["--exec", "sleep", "infinity"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self(Some(child)))
+    }
+}
+
+impl Drop for WslKeepalive {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli_subcommand().await? {
         return Ok(());
     }
+    let _wsl_keepalive = WslKeepalive::start()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter("warn")
