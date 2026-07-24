@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use sqlx::PgPool;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +200,29 @@ pub async fn remember(
     let threads = normalize_threads(&req.threads);
     let primary_date = Local::now().date_naive();
     let dates = derive_dates(&source_path, primary_date);
+    let chunks = chunk_body(&req.body);
+    let mut warnings = Vec::new();
+    let vectors = if cfg.test_embedding_disabled {
+        warnings.push("semantic embeddings disabled; lexical chunks retained".into());
+        None
+    } else {
+        let url = cfg
+            .embed_url
+            .as_deref()
+            .ok_or_else(|| AppError::Embedding("embedding endpoint is required".into()))?;
+        let vectors = embed(
+            &HTTP_CLIENT,
+            url,
+            &cfg.embed_model,
+            &chunks,
+            cfg.embed_dimension,
+        )
+        .await?;
+        if vectors.len() != chunks.len() {
+            return Err(AppError::Embedding("embedding count mismatch".into()));
+        }
+        Some(vectors)
+    };
     let mut tx = pool.begin().await?;
     let meta = serde_json::json!({"origin":"direct-db-write", "recorded_at": chrono::Utc::now().to_rfc3339()});
     let memory_id: i64 = sqlx::query_scalar(r#"INSERT INTO memories (room,type,date,dates,title,source_path,body,threads,meta) VALUES ($1,'memory',$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (room,source_path) DO UPDATE SET type='memory',date=EXCLUDED.date,dates=EXCLUDED.dates,title=EXCLUDED.title,body=EXCLUDED.body,threads=EXCLUDED.threads,meta=EXCLUDED.meta RETURNING id"#)
@@ -226,38 +249,28 @@ pub async fn remember(
         .bind(memory_id)
         .execute(&mut *tx)
         .await?;
-    let chunks = chunk_body(&req.body);
-    let mut warnings = Vec::new();
-    if cfg.test_embedding_disabled {
-        warnings.push("embedding disabled for isolated test; chunks cleared".into());
-    } else {
-        let url = cfg
-            .embed_url
-            .as_deref()
-            .ok_or_else(|| AppError::Embedding("embedding endpoint is required".into()))?;
-        let vectors = embed(
-            &HTTP_CLIENT,
-            url,
-            &cfg.embed_model,
-            &chunks,
-            cfg.embed_dimension,
-        )
-        .await?;
-        if vectors.len() != chunks.len() {
-            return Err(AppError::Embedding("embedding count mismatch".into()));
-        }
-        for (idx, (text, start, end, heading)) in chunks.iter().enumerate() {
-            let vector_text = format!(
+    for (idx, (text, start, end, heading)) in chunks.iter().enumerate() {
+        let vector_text = vectors.as_ref().map(|vectors| {
+            format!(
                 "[{}]",
                 vectors[idx]
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",")
-            );
-            sqlx::query("INSERT INTO memory_chunks (memory_id,chunk_index,heading_path,body,char_start,char_end,token_estimate,body_embedding,embedded_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,NOW())")
-                .bind(memory_id).bind(idx as i32).bind(heading).bind(text).bind(*start as i32).bind(*end as i32).bind(token_estimate(text)).bind(vector_text).execute(&mut *tx).await?;
-        }
+            )
+        });
+        sqlx::query("INSERT INTO memory_chunks (memory_id,chunk_index,heading_path,body,char_start,char_end,token_estimate,body_embedding,embedded_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,CASE WHEN $8 IS NULL THEN NULL ELSE NOW() END)")
+            .bind(memory_id)
+            .bind(idx as i32)
+            .bind(heading)
+            .bind(text)
+            .bind(*start as i32)
+            .bind(*end as i32)
+            .bind(token_estimate(text))
+            .bind(vector_text)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     if req.backup
@@ -465,6 +478,7 @@ pub(crate) async fn embed(
     let input = chunks.iter().map(|x| format!("passage: {}", x.0)).collect();
     let value: serde_json::Value = client
         .post(url)
+        .timeout(Duration::from_secs(20))
         .json(&Input { model, input })
         .send()
         .await

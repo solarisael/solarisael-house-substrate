@@ -325,38 +325,68 @@ async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(true)
 }
 
-struct WslKeepalive(Option<Child>);
+trait KeepaliveProcess {
+    fn terminate(&mut self);
+}
 
-impl WslKeepalive {
-    fn start() -> Result<Self, std::io::Error> {
-        if !cfg!(windows) || env::var("SOLARISAEL_PG_WSL").as_deref() != Ok("1") {
-            return Ok(Self(None));
-        }
-        let child = Command::new("wsl.exe")
-            .args(["--exec", "sleep", "infinity"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(Self(Some(child)))
+struct ChildKeepalive(Child);
+
+impl KeepaliveProcess for ChildKeepalive {
+    fn terminate(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
-impl Drop for WslKeepalive {
+struct WslKeepalive<P: KeepaliveProcess>(Option<P>);
+
+fn keepalive_requested(is_windows: bool, flag: Option<&str>) -> bool {
+    is_windows && flag == Some("1")
+}
+
+impl WslKeepalive<ChildKeepalive> {
+    fn start() -> Result<Self, std::io::Error> {
+        let flag = env::var("SOLARISAEL_PG_WSL").ok();
+        Self::start_with(cfg!(windows), flag.as_deref(), || {
+            Command::new("wsl.exe")
+                .args(["--exec", "sleep", "infinity"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(ChildKeepalive)
+        })
+    }
+}
+
+impl<P: KeepaliveProcess> WslKeepalive<P> {
+    fn start_with<F>(is_windows: bool, flag: Option<&str>, spawn: F) -> Result<Self, std::io::Error>
+    where
+        F: FnOnce() -> Result<P, std::io::Error>,
+    {
+        if !keepalive_requested(is_windows, flag) {
+            return Ok(Self(None));
+        }
+        Ok(Self(Some(spawn()?)))
+    }
+}
+
+// Cleanup is guaranteed for ordinary Rust teardown. A forced process kill skips
+// Drop, so this process cannot reap a keepalive in that case.
+impl<P: KeepaliveProcess> Drop for WslKeepalive<P> {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(process) = self.0.as_mut() {
+            process.terminate();
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _wsl_keepalive = WslKeepalive::start()?;
     if cli_subcommand().await? {
         return Ok(());
     }
-    let _wsl_keepalive = WslKeepalive::start()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter("warn")
@@ -425,6 +455,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct ProbeProcess(Arc<AtomicBool>);
+
+    impl KeepaliveProcess for ProbeProcess {
+        fn terminate(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn wsl_keepalive_selection_and_normal_teardown_are_bounded() {
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let terminated = Arc::new(AtomicBool::new(false));
+
+        let disabled = WslKeepalive::<ProbeProcess>::start_with(false, Some("1"), {
+            let spawn_calls = Arc::clone(&spawn_calls);
+            let terminated = Arc::clone(&terminated);
+            move || {
+                spawn_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ProbeProcess(terminated))
+            }
+        })
+        .expect("disabled keepalive must not fail");
+        assert!(disabled.0.is_none());
+
+        let disabled = WslKeepalive::<ProbeProcess>::start_with(true, None, {
+            let spawn_calls = Arc::clone(&spawn_calls);
+            let terminated = Arc::clone(&terminated);
+            move || {
+                spawn_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ProbeProcess(terminated))
+            }
+        })
+        .expect("unflagged keepalive must not fail");
+        assert!(disabled.0.is_none());
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+
+        {
+            let enabled = WslKeepalive::<ProbeProcess>::start_with(true, Some("1"), {
+                let spawn_calls = Arc::clone(&spawn_calls);
+                let terminated = Arc::clone(&terminated);
+                move || {
+                    spawn_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(ProbeProcess(terminated))
+                }
+            })
+            .expect("enabled keepalive must start");
+            assert!(enabled.0.is_some());
+            assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
+        }
+
+        assert!(terminated.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn adapter_supersedes_strings_are_positive_and_deduplicated() {

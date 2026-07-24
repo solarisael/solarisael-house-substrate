@@ -1,5 +1,7 @@
 use house_protocol::{ClusterMaintenanceResultWire, ResponseEnvelope};
-use solarisael_house_substrate::{Config, RememberRequest, backup::source_migrations, remember};
+use solarisael_house_substrate::{
+    Config, RecallParams, RememberRequest, backup::source_migrations, recall, remember,
+};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -58,6 +60,7 @@ async fn isolated_database_guard() {
         test_embedding_disabled: true,
     };
     let source_path = format!("isolated-test/{}", Uuid::new_v4());
+    let body = "This mutation proves the dedicated PostgreSQL authority path.";
     let receipt = remember(
         &pool,
         &cfg,
@@ -65,7 +68,7 @@ async fn isolated_database_guard() {
             room: "isolated-test".into(),
             kind: "memory".into(),
             title: "isolated integration proof".into(),
-            body: "This mutation proves the dedicated PostgreSQL authority path.".into(),
+            body: body.into(),
             lesson: None,
             source_path: Some(source_path.clone()),
             source_memory_path: None,
@@ -93,6 +96,37 @@ async fn isolated_database_guard() {
             .await
             .unwrap();
     assert_eq!(count, 1);
+    let lexical_chunks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM memory_chunks WHERE memory_id=$1 AND body_embedding IS NULL",
+    )
+    .bind(receipt.memory_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(lexical_chunks > 0);
+    let recalled = recall(
+        &pool,
+        &cfg,
+        RecallParams {
+            room: "isolated-test".into(),
+            query: body.into(),
+            semantic_top_k: 1,
+            semantic_min_similarity: 0.5,
+            content_top_k: 8,
+            content_min_similarity: 0.3,
+        },
+    )
+    .await
+    .expect("lexical recall must succeed with embeddings disabled");
+    assert!(recalled.found);
+    assert!(
+        recalled.content_chunks.iter().any(|chunk| {
+            chunk.get("source_path").and_then(serde_json::Value::as_str)
+                == Some(source_path.as_str())
+                && chunk.get("body").and_then(serde_json::Value::as_str) == Some(body)
+        }),
+        "lexical recall must return the exact written body for the written source path"
+    );
     sqlx::query("DELETE FROM memories WHERE room=$1 AND source_path=$2")
         .bind("isolated-test")
         .bind(source_path)
