@@ -106,8 +106,9 @@ impl Config {
                 "embedding dimension must be 2048 for migration 0002".into(),
             ));
         }
-        let test_embedding_disabled =
-            dotenv_value("SOLARISAEL_TEST_DISABLE_EMBEDDING").as_deref() == Some("1");
+        let test_embedding_disabled = dotenv_value("SOLARISAEL_DISABLE_EMBEDDING").as_deref()
+            == Some("1")
+            || dotenv_value("SOLARISAEL_TEST_DISABLE_EMBEDDING").as_deref() == Some("1");
         Ok(Self {
             database_url,
             embed_model: dotenv_value("SOLARISAEL_EMBED_MODEL")

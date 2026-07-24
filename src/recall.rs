@@ -4,7 +4,10 @@ use chrono::NaiveDate;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 fn default_semantic_top_k() -> u32 {
     8
@@ -143,6 +146,7 @@ async fn embed_query(
     }
     let value: serde_json::Value = client
         .post(url)
+        .timeout(Duration::from_secs(20))
         .json(&Input {
             model,
             input: vec![format!("query: {query}")],
