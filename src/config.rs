@@ -4,7 +4,7 @@ use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{env, fs, io, path::Path, str::FromStr, sync::LazyLock};
+use std::{env, fs, io, path::Path, str::FromStr, sync::LazyLock, time::Duration};
 use thiserror::Error;
 
 const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:11435/api/embed";
@@ -123,6 +123,7 @@ impl Config {
             .map_err(|e| AppError::Config(format!("invalid database configuration: {e}")))?;
         let pool = PgPoolOptions::new()
             .max_connections(4)
+            .acquire_timeout(Duration::from_secs(120))
             .connect_with(options)
             .await?;
         let shape: String = sqlx::query_scalar("SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='memory_chunks' AND a.attname='body_embedding' AND NOT a.attisdropped")
