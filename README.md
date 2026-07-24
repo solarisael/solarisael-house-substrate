@@ -1,7 +1,7 @@
 # Solarisael House Substrate
 
-**the backend that makes House memory stick — start at the [hub](https://github.com/solarisael/solarisael-house).**
-This repository is the optional **AKASHA** backend: Rust, PostgreSQL, pgvector, and local embeddings for [Solarisael House](https://github.com/solarisael/solarisael-house).
+**the backend that makes House memory stick — start at the [hub](https://github.com/solarisael/the-athanor).**
+This repository is the optional **AKASHA** backend: Rust, PostgreSQL, pgvector, and local embeddings for [Solarisael House](https://github.com/solarisael/the-athanor).
 The public source is [`solarisael/solarisael-house-substrate`](https://github.com/solarisael/solarisael-house-substrate).
 
 This is the optional **AKASHA** backend. **Vault** is file-backed and
