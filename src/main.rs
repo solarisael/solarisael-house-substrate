@@ -109,6 +109,7 @@ fn recall_service_request(request: DomainRecallRequest) -> RecallParams {
         semantic_min_similarity: request.semantic_min_similarity(),
         content_top_k: request.content_top_k(),
         content_min_similarity: request.content_min_similarity(),
+        temporal_decay: request.temporal_decay(),
     }
 }
 

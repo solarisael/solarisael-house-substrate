@@ -180,6 +180,7 @@ fn validation_failure_has_request_owner_and_safe_execution() {
         semantic_min_similarity: 0.5,
         content_top_k: 8,
         content_min_similarity: 0.3,
+        temporal_decay: false,
     };
     let error = params
         .validate()

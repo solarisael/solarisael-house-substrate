@@ -177,6 +177,7 @@ mod tests {
             semantic_min_similarity: 0.5,
             content_top_k: 8,
             content_min_similarity: 0.3,
+            temporal_decay: false,
         };
         assert!(p.validate().is_err());
         p.query = "x".into();

@@ -858,6 +858,11 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
         .fetch_one(pool)
         .await?;
     let memory_meta: Json<Value> = memory_row.try_get("meta")?;
+    let candidate_created_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM giga_candidates WHERE candidate_id=$1")
+            .bind("promote-memory")
+            .fetch_one(pool)
+            .await?;
     require(
         memory_row.try_get::<String, _>("room")? == ROOM
             && memory_row.try_get::<Option<String>, _>("title")?.as_deref()
@@ -867,7 +872,11 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
             && memory_row.try_get::<Vec<String>, _>("threads")?
                 == vec!["atomicity".to_owned(), "integration".to_owned()]
             && memory_meta.0["candidate_id"] == "promote-memory"
-            && memory_meta.0["origin"] == "giga-promotion",
+            && memory_meta.0["origin"] == "giga-promotion"
+            && memory_meta.0["giga"]["durability"].as_f64() == Some(0.9)
+            && memory_meta.0["giga"]["decay_anchor"] == "candidate_created_at"
+            && candidate_created_at.to_rfc3339() == "2030-01-01T00:30:01+00:00"
+            && memory_meta.0["giga"]["decay_anchor_at"] == "2030-01-01T00:30:01+00:00",
         "memory promotion must persist the edited payload and GIGA provenance",
     )?;
     let memory_chunks: i64 =

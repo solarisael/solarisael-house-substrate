@@ -1819,7 +1819,7 @@ pub async fn giga_promote(
         request.candidate_id()
     );
     let source_provenance = promotion_sources_json(request.source_refs());
-    let metadata = json!({
+    let mut metadata = json!({
         "origin": "giga-promotion",
         "authority": GigaPromotionAuthority::Full.as_str(),
         "origin_room": request.room().to_string(),
@@ -1847,6 +1847,15 @@ pub async fn giga_promote(
             "run_id": candidate.try_get::<String, _>("classifier_run_id")?,
         },
     });
+    if matches!(request.payload(), GigaPromotionPayload::Memory(_)) {
+        let durability: f64 = candidate.try_get("durability")?;
+        let candidate_created_at: DateTime<Utc> = candidate.try_get("created_at")?;
+        metadata["giga"] = json!({
+            "durability": durability,
+            "decay_anchor": "candidate_created_at",
+            "decay_anchor_at": candidate_created_at.to_rfc3339(),
+        });
+    }
     let (durable_kind, durable_id) = match request.payload() {
         GigaPromotionPayload::Memory(payload) => {
             let (prepared_event_id, prepared_source_path, prepared) =

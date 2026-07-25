@@ -2,9 +2,54 @@ use house_protocol::{ClusterMaintenanceResultWire, ResponseEnvelope};
 use solarisael_house_substrate::{
     Config, RecallParams, RememberRequest, backup::source_migrations, recall, remember,
 };
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+    types::Json,
+};
 use std::str::FromStr;
 use uuid::Uuid;
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn require(condition: bool, message: &str) -> TestResult {
+    if condition {
+        Ok(())
+    } else {
+        Err(message.into())
+    }
+}
+
+async fn insert_lexical_memory(
+    pool: &PgPool,
+    room: &str,
+    source_path: &str,
+    body: &str,
+    meta: serde_json::Value,
+    superseded_by: Option<i64>,
+) -> TestResult<i64> {
+    let memory_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memories (room,type,title,source_path,body,meta,superseded_by)
+         VALUES ($1,'memory',$2,$2,$3,$4,$5) RETURNING id",
+    )
+    .bind(room)
+    .bind(source_path)
+    .bind(body)
+    .bind(Json(meta))
+    .bind(superseded_by)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO memory_chunks (memory_id,chunk_index,body,char_start,char_end)
+         VALUES ($1,0,$2,0,$3)",
+    )
+    .bind(memory_id)
+    .bind(body)
+    .bind(i32::try_from(body.len())?)
+    .execute(pool)
+    .await?;
+    Ok(memory_id)
+}
 
 fn isolated_database_url() -> String {
     let url = std::env::var("SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL")
@@ -114,6 +159,7 @@ async fn isolated_database_guard() {
             semantic_min_similarity: 0.5,
             content_top_k: 8,
             content_min_similarity: 0.3,
+            temporal_decay: false,
         },
     )
     .await
@@ -134,6 +180,244 @@ async fn isolated_database_guard() {
         .await
         .unwrap();
     pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL and an isolated PostgreSQL database"]
+async fn lexical_recall_applies_durability_decay_only_when_requested() {
+    let url = isolated_database_url();
+    let options = PgConnectOptions::from_str(&url).expect("dedicated test URL must be valid");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .expect("isolated database must be reachable");
+    let schema = format!("solarisael_decay_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .expect("isolated decay schema must create");
+
+    let connection_schema = schema.clone();
+    let pool_result = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |connection, _meta| {
+            let schema = connection_schema.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {schema}, public"))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await;
+
+    let result: TestResult = match pool_result {
+        Ok(pool) => {
+            let result: TestResult = async {
+                sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+                    .execute(&pool)
+                    .await?;
+
+                let room = "temporal-decay-integration";
+                let body = "identical lexical durability recall evidence";
+                let old_anchor = (chrono::Utc::now() - chrono::Duration::days(28)).to_rfc3339();
+                let giga_meta = |durability: f64| {
+                    serde_json::json!({
+                        "origin": "giga-promotion",
+                        "giga": {
+                            "durability": durability,
+                            "decay_anchor": "candidate_created_at",
+                            "decay_anchor_at": old_anchor,
+                        },
+                    })
+                };
+                let replacement_id = insert_lexical_memory(
+                    &pool,
+                    room,
+                    "z-replacement",
+                    "unrelated successor sentinel",
+                    serde_json::json!({}),
+                    None,
+                )
+                .await?;
+                insert_lexical_memory(&pool, room, "a-low-durability", body, giga_meta(0.0), None)
+                    .await?;
+                insert_lexical_memory(&pool, room, "b-high-durability", body, giga_meta(1.0), None)
+                    .await?;
+                insert_lexical_memory(&pool, room, "c-legacy", body, serde_json::json!({}), None)
+                    .await?;
+                insert_lexical_memory(
+                    &pool,
+                    room,
+                    "d-superseded",
+                    body,
+                    giga_meta(1.0),
+                    Some(replacement_id),
+                )
+                .await?;
+
+                let cfg = Config {
+                    database_url: url.clone(),
+                    embed_url: None,
+                    embed_model: "test-disabled".into(),
+                    embed_dimension: 2_048,
+                    embed_required: false,
+                    test_embedding_disabled: true,
+                };
+                let params = RecallParams {
+                    room: room.into(),
+                    query: body.into(),
+                    semantic_top_k: 1,
+                    semantic_min_similarity: 0.0,
+                    content_top_k: 8,
+                    content_min_similarity: 0.0,
+                    temporal_decay: true,
+                };
+                let decayed = recall(&pool, &cfg, params).await?;
+                let decayed_paths = decayed
+                    .retrieval_candidates
+                    .iter()
+                    .filter_map(|candidate| candidate["source_path"].as_str())
+                    .collect::<Vec<_>>();
+                let high_rank = decayed_paths
+                    .iter()
+                    .position(|path| *path == "b-high-durability");
+                let low_rank = decayed_paths
+                    .iter()
+                    .position(|path| *path == "a-low-durability");
+                require(
+                    matches!((high_rank, low_rank), (Some(high), Some(low)) if high < low),
+                    "temporal decay must rank equal-relevance high durability above low durability",
+                )?;
+                let legacy = decayed
+                    .content_chunks
+                    .iter()
+                    .find(|chunk| chunk["source_path"] == "c-legacy")
+                    .ok_or("legacy lexical fixture must be recalled")?;
+                require(
+                    legacy["temporal_weight"].as_f64() == Some(1.0)
+                        && legacy["durability"].is_null(),
+                    "legacy metadata must retain weight one",
+                )?;
+                let relevance = decayed
+                    .content_chunks
+                    .iter()
+                    .filter(|chunk| {
+                        matches!(
+                            chunk["source_path"].as_str(),
+                            Some("a-low-durability" | "b-high-durability" | "c-legacy")
+                        )
+                    })
+                    .filter_map(|chunk| chunk["ws"].as_f64())
+                    .collect::<Vec<_>>();
+                require(
+                    relevance.len() == 3
+                        && relevance
+                            .iter()
+                            .all(|score| (score - relevance[0]).abs() < 1e-12),
+                    "ranking fixtures must have equal lexical relevance",
+                )?;
+
+                let cutoff = recall(
+                    &pool,
+                    &cfg,
+                    RecallParams {
+                        room: room.into(),
+                        query: body.into(),
+                        semantic_top_k: 1,
+                        semantic_min_similarity: 0.0,
+                        content_top_k: 2,
+                        content_min_similarity: 0.0,
+                        temporal_decay: true,
+                    },
+                )
+                .await?;
+                let cutoff_paths = cutoff
+                    .content_chunks
+                    .iter()
+                    .filter_map(|chunk| chunk["source_path"].as_str())
+                    .collect::<Vec<_>>();
+                require(
+                    cutoff_paths == vec!["b-high-durability", "c-legacy"],
+                    "durability reranking must happen before the requested top-K cutoff",
+                )?;
+                require(
+                    decayed
+                        .content_chunks
+                        .iter()
+                        .all(|chunk| chunk["source_path"].as_str() != Some("d-superseded"))
+                        && decayed.retrieval_candidates.iter().all(|candidate| {
+                            candidate["source_path"].as_str() != Some("d-superseded")
+                        }),
+                    "superseded rows must be absent from every ordinary recall surface",
+                )?;
+
+                let bypassed = recall(
+                    &pool,
+                    &cfg,
+                    RecallParams {
+                        room: room.into(),
+                        query: body.into(),
+                        semantic_top_k: 1,
+                        semantic_min_similarity: 0.0,
+                        content_top_k: 8,
+                        content_min_similarity: 0.0,
+                        temporal_decay: false,
+                    },
+                )
+                .await?;
+                let bypassed_paths = bypassed
+                    .retrieval_candidates
+                    .iter()
+                    .filter_map(|candidate| candidate["source_path"].as_str())
+                    .collect::<Vec<_>>();
+                let bypassed_low = bypassed_paths
+                    .iter()
+                    .position(|path| *path == "a-low-durability");
+                let bypassed_high = bypassed_paths
+                    .iter()
+                    .position(|path| *path == "b-high-durability");
+                require(
+                    matches!(
+                        (bypassed_low, bypassed_high),
+                        (Some(low), Some(high)) if low < high
+                    ),
+                    "explicit temporal bypass must restore equal-relevance lexical ordering",
+                )?;
+                require(
+                    bypassed.content_chunks.iter().all(|chunk| {
+                        chunk["temporal_weight"].as_f64() == Some(1.0)
+                            && chunk["durability"].is_null()
+                    }),
+                    "explicit temporal bypass must remove every decay contribution",
+                )?;
+                require(
+                    bypassed
+                        .content_chunks
+                        .iter()
+                        .all(|chunk| chunk["source_path"].as_str() != Some("d-superseded"))
+                        && bypassed.retrieval_candidates.iter().all(|candidate| {
+                            candidate["source_path"].as_str() != Some("d-superseded")
+                        }),
+                    "temporal bypass must not weaken supersession isolation",
+                )?;
+                Ok(())
+            }
+            .await;
+            pool.close().await;
+            result
+        }
+        Err(error) => Err(error.into()),
+    };
+
+    let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup.expect("isolated decay schema cleanup must succeed");
+    result.expect("lexical durability decay integration contract");
 }
 
 #[tokio::test]
