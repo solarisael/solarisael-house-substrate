@@ -217,6 +217,10 @@ pub async fn recall(
     params.validate()?;
     let query_dates = query_dates(&params.query);
     let query_terms = query_terms(&params.query);
+    let content_patterns = query_terms
+        .iter()
+        .map(|term| format!("%{term}%"))
+        .collect::<Vec<_>>();
     let rooms = vec![params.room.clone(), "house".to_string()];
     let mut warnings = Vec::new();
     let vector_text = match (cfg.test_embedding_disabled, cfg.embed_url.as_deref()) {
@@ -275,8 +279,8 @@ pub async fn recall(
             semantic_chunks.push(serde_json::json!({"source_path":source_path,"title":title,"heading_path":heading_path,"body":bounded_excerpt(&body),"char_start":row.try_get::<i32,_>("char_start")?,"char_end":row.try_get::<i32,_>("char_end")?,"chunk_index":row.try_get::<i32,_>("chunk_index")?,"sim":sim,"matched_terms":matched_terms,"missing_terms":missing_terms,"term_coverage":coverage,"evidence":"semantic cosine similarity"}));
         }
     }
-    let content_rows = sqlx::query("SELECT m.source_path,coalesce(m.title,'') AS title,coalesce(c.heading_path,'') AS heading_path,c.body,c.char_start,c.char_end,c.chunk_index,word_similarity(c.body,$1)::double precision AS sim FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.room = ANY($2::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL AND ($5::text[] = '{}'::text[] OR EXISTS (SELECT 1 FROM unnest($5::text[]) term WHERE lower(c.body) LIKE '%' || term || '%')) AND word_similarity(c.body,$1) >= $3 ORDER BY sim DESC,m.source_path,c.chunk_index LIMIT $4")
-        .bind(&params.query).bind(&rooms).bind(params.content_min_similarity).bind(params.content_top_k as i64).bind(&query_terms).fetch_all(pool).await?;
+    let content_rows = sqlx::query("SELECT m.source_path,coalesce(m.title,'') AS title,coalesce(c.heading_path,'') AS heading_path,c.body,c.char_start,c.char_end,c.chunk_index,word_similarity(c.body,$1)::double precision AS sim FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.room = ANY($2::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL AND ($5::text[] = '{}'::text[] OR c.body ILIKE ANY($5::text[])) AND word_similarity(c.body,$1) >= $3 ORDER BY sim DESC,m.source_path,c.chunk_index LIMIT $4")
+        .bind(&params.query).bind(&rooms).bind(params.content_min_similarity).bind(params.content_top_k as i64).bind(&content_patterns).fetch_all(pool).await?;
     let mut content_chunks = Vec::new();
     for row in content_rows {
         let sim: f64 = row.try_get("sim")?;

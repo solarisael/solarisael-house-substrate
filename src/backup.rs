@@ -1,9 +1,9 @@
+use chrono::{DateTime, Utc};
 use house_protocol::{
     DiagnosticCategory, DiagnosticDetails, DiagnosticEvidence, DiagnosticExecution,
     DiagnosticNextCheck, DiagnosticOwner, DiagnosticRetry, DiagnosticStage, DiagnosticTarget,
     DiagnosticTargetKind, DiagnosticWriteOutcome,
 };
-use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2"];
+const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2", "3", "4", "5"];
 const LEGACY_MIGRATIONS: &[&str] = &[
     "0001_create_memories",
     "0002_memory_threads_pivot",
@@ -79,7 +79,7 @@ impl BackupError {
                 DiagnosticWriteOutcome::NotStarted,
                 DiagnosticTarget::new(DiagnosticTargetKind::File, "src/backup.rs"),
             ),
-            Self::Io(error) => (
+            Self::Io(_) => (
                 "filesystem_error",
                 DiagnosticRetry::ReconcileFirst,
                 DiagnosticWriteOutcome::Unknown,
@@ -129,7 +129,10 @@ impl BackupError {
                     .summary("Backup diagnostics omit command stderr, database URLs, and passwords")
                     .data(observed),
             )
-            .target(DiagnosticTarget::new(DiagnosticTargetKind::File, "src/backup.rs"))
+            .target(DiagnosticTarget::new(
+                DiagnosticTargetKind::File,
+                "src/backup.rs",
+            ))
             .target(target.clone())
             .next_check(
                 DiagnosticNextCheck::new("inspect_backup_target")

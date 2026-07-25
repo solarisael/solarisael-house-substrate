@@ -71,11 +71,21 @@ fn error_details(response: &Value) -> &Value {
     }
     assert!(details["owner"].get("path").is_some());
     assert!(details["owner"].get("symbol").is_some());
-    assert!(details["evidence"].as_array().is_some_and(|items| !items.is_empty()));
-    assert!(details["targets"].as_array().is_some_and(|items| !items.is_empty()));
-    assert!(details["next_checks"]
-        .as_array()
-        .is_some_and(|items| !items.is_empty()));
+    assert!(
+        details["evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert!(
+        details["targets"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert!(
+        details["next_checks"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
     details
 }
 
@@ -99,9 +109,11 @@ fn missing_configuration_returns_complete_responses_and_keeps_jsonl_alive() {
             details["observed"]["dotenv"]["target"],
             dotenv_path.to_string_lossy().as_ref()
         );
-        assert!(details["observed"]["environment_keys"]["missing_keys"]
-            .as_array()
-            .is_some_and(|keys| keys.iter().any(|key| key == "DATABASE_URL")));
+        assert!(
+            details["observed"]["environment_keys"]["missing_keys"]
+                .as_array()
+                .is_some_and(|keys| keys.iter().any(|key| key == "DATABASE_URL"))
+        );
     }
 }
 
@@ -110,7 +122,10 @@ fn invalid_embedding_dimension_reports_configuration_without_environment_values(
     let request = r#"{"protocol":1,"id":"dimension","method":"recall","params":{"room":"room","query":"needle"}}"#;
     let (responses, _) = jsonl_with_environment(
         &[
-            ("SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL", "postgres://localhost/substrate"),
+            (
+                "SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL",
+                "postgres://localhost/substrate",
+            ),
             ("SOLARISAEL_EMBED_DIMENSION", "1024"),
         ],
         &[request],
@@ -120,10 +135,7 @@ fn invalid_embedding_dimension_reports_configuration_without_environment_values(
     let details = error_details(response);
     assert_eq!(details["category"], "configuration");
     assert_eq!(details["stage"], "configuration_load");
-    assert_eq!(
-        details["expected"]["SOLARISAEL_EMBED_DIMENSION"],
-        "2048"
-    );
+    assert_eq!(details["expected"]["SOLARISAEL_EMBED_DIMENSION"], "2048");
     assert_eq!(
         details["observed"]["reason"],
         "embedding_dimension_incompatible"
@@ -169,7 +181,9 @@ fn validation_failure_has_request_owner_and_safe_execution() {
         content_top_k: 8,
         content_min_similarity: 0.3,
     };
-    let error = params.validate().expect_err("invalid room must fail validation");
+    let error = params
+        .validate()
+        .expect_err("invalid room must fail validation");
     let body = error.protocol_error_body("recall");
     let body = serde_json::to_value(body).expect("error serializes");
     let response = serde_json::json!({"protocol": 1, "error": body});

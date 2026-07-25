@@ -174,7 +174,19 @@ fn configuration_observed(dotenv: &Dotenv, reason: &str) -> Value {
 }
 
 fn is_write_operation(operation: &str) -> bool {
-    matches!(operation, "remember" | "anamnesis_write" | "cluster_maintenance")
+    matches!(
+        operation,
+        "remember"
+            | "anamnesis_write"
+            | "cluster_maintenance"
+            | "giga_event_ingest"
+            | "giga_process"
+            | "giga_event_claim"
+            | "giga_event_finish"
+            | "giga_event_replay"
+            | "giga_promote"
+            | "giga_review"
+    )
 }
 
 fn validation_owner(operation: &str) -> (&'static str, &'static str) {
@@ -184,6 +196,15 @@ fn validation_owner(operation: &str) -> (&'static str, &'static str) {
         "anamnesis" => ("src/anamnesis.rs", "AnamnesisParams::validate"),
         "anamnesis_write" => ("src/anamnesis.rs", "anamnesis_write"),
         "cluster_maintenance" => ("src/cluster.rs", "cluster_maintenance"),
+        "giga_event_ingest" => ("src/giga.rs", "giga_event_ingest"),
+        "giga_process" => ("src/giga_worker.rs", "giga_process"),
+        "giga_event_claim" => ("src/giga.rs", "giga_event_claim"),
+        "giga_event_finish" => ("src/giga.rs", "giga_event_finish"),
+        "giga_event_replay" => ("src/giga.rs", "giga_event_replay"),
+        "giga_promote" => ("src/giga.rs", "giga_promote"),
+        "giga_candidate_list" => ("src/giga.rs", "giga_candidate_list"),
+        "giga_review" => ("src/giga.rs", "giga_review"),
+        "giga_health" => ("src/giga.rs", "giga_health"),
         _ => ("src/main.rs", "decode_line"),
     }
 }
@@ -215,6 +236,15 @@ fn database_owner(operation: &str) -> (&'static str, &'static str) {
         "anamnesis" => ("src/anamnesis.rs", "anamnesis"),
         "anamnesis_write" => ("src/anamnesis.rs", "anamnesis_write"),
         "cluster_maintenance" => ("src/cluster.rs", "cluster_maintenance"),
+        "giga_event_ingest" => ("src/giga.rs", "giga_event_ingest"),
+        "giga_process" => ("src/giga_worker.rs", "giga_process"),
+        "giga_event_claim" => ("src/giga.rs", "giga_event_claim"),
+        "giga_event_finish" => ("src/giga.rs", "giga_event_finish"),
+        "giga_event_replay" => ("src/giga.rs", "giga_event_replay"),
+        "giga_promote" => ("src/giga.rs", "giga_promote"),
+        "giga_candidate_list" => ("src/giga.rs", "giga_candidate_list"),
+        "giga_review" => ("src/giga.rs", "giga_review"),
+        "giga_health" => ("src/giga.rs", "giga_health"),
         _ => ("src/config.rs", "Config::pool"),
     }
 }
@@ -263,11 +293,7 @@ impl AppError {
                 let (path, symbol) = validation_owner(operation);
                 DiagnosticDetails::new(DiagnosticCategory::Input, DiagnosticStage::Validation)
                     .operation(operation)
-                    .owner(
-                        DiagnosticOwner::new(component)
-                            .path(path)
-                            .symbol(symbol),
-                    )
+                    .owner(DiagnosticOwner::new(component).path(path).symbol(symbol))
                     .expected(json!({"request_parameters": "must satisfy method validation rules"}))
                     .observed(json!({
                         "validation": "failed",
@@ -291,11 +317,9 @@ impl AppError {
                             ))
                             .expected(json!({"valid": true})),
                     )
-                    .next_check(
-                        DiagnosticNextCheck::new("retry_request").expected(json!({
-                            "after": "request validation succeeds",
-                        })),
-                    )
+                    .next_check(DiagnosticNextCheck::new("retry_request").expected(json!({
+                        "after": "request validation succeeds",
+                    })))
                     .execution(DiagnosticExecution::new(
                         false,
                         DiagnosticWriteOutcome::NotStarted,
@@ -331,12 +355,10 @@ impl AppError {
                     "embedding_column_missing" | "embedding_schema_incompatible" => {
                         DiagnosticTarget::new(DiagnosticTargetKind::Migration, "0002")
                     }
-                    "cluster_embedding_schema_incompatible" => {
-                        DiagnosticTarget::new(
-                            DiagnosticTargetKind::Table,
-                            "memory_chunks.body_embedding",
-                        )
-                    }
+                    "cluster_embedding_schema_incompatible" => DiagnosticTarget::new(
+                        DiagnosticTargetKind::Table,
+                        "memory_chunks.body_embedding",
+                    ),
                     "database_configuration_invalid" => {
                         DiagnosticTarget::new(DiagnosticTargetKind::RequestField, "DATABASE_URL")
                     }
@@ -418,9 +440,15 @@ impl AppError {
                     DiagnosticStage::Transaction
                 };
                 let (write_outcome, retry) = if schema {
-                    (DiagnosticWriteOutcome::NotStarted, DiagnosticRetry::AfterChange)
+                    (
+                        DiagnosticWriteOutcome::NotStarted,
+                        DiagnosticRetry::AfterChange,
+                    )
                 } else if write && !connection {
-                    (DiagnosticWriteOutcome::Unknown, DiagnosticRetry::ReconcileFirst)
+                    (
+                        DiagnosticWriteOutcome::Unknown,
+                        DiagnosticRetry::ReconcileFirst,
+                    )
                 } else {
                     (DiagnosticWriteOutcome::NotStarted, DiagnosticRetry::SafeNow)
                 };
@@ -431,7 +459,10 @@ impl AppError {
                 };
                 let first_check = if schema {
                     DiagnosticNextCheck::new("apply_migration")
-                        .target(DiagnosticTarget::new(DiagnosticTargetKind::Migration, "0002"))
+                        .target(DiagnosticTarget::new(
+                            DiagnosticTargetKind::Migration,
+                            "0002",
+                        ))
                         .expected(json!({"memory_chunks.body_embedding": "vector(2048)"}))
                 } else {
                     DiagnosticNextCheck::new("check_database_connectivity")
@@ -557,7 +588,10 @@ impl AppError {
                         DiagnosticEvidence::new("protocol_conversion_failure")
                             .summary("Protocol conversion rejected the request"),
                     )
-                    .target(DiagnosticTarget::new(DiagnosticTargetKind::Symbol, "decode_line"))
+                    .target(DiagnosticTarget::new(
+                        DiagnosticTargetKind::Symbol,
+                        "decode_line",
+                    ))
                     .next_check(
                         DiagnosticNextCheck::new("validate_protocol_envelope")
                             .expected(json!({"protocol": 1})),
@@ -568,37 +602,35 @@ impl AppError {
                         DiagnosticRetry::Never,
                     ))
             }
-            Self::Io(error) => {
-                DiagnosticDetails::new(
-                    DiagnosticCategory::Filesystem,
-                    DiagnosticStage::RequestWrite,
-                )
-                .operation(operation)
-                .owner(
-                    DiagnosticOwner::new(component)
-                        .path("src/config.rs")
-                        .symbol("filesystem operation"),
-                )
-                .expected(json!({"filesystem_operation": "complete successfully"}))
-                .observed(json!({"io_error_kind": error.kind().to_string()}))
-                .evidence(
-                    DiagnosticEvidence::new("io_error")
-                        .summary("Filesystem error details were reduced to the error kind")
-                        .data(json!({"io_error_kind": error.kind().to_string()})),
-                )
-                .target(DiagnosticTarget::new(DiagnosticTargetKind::File, ".env"))
-                .next_check(
-                    DiagnosticNextCheck::new("check_filesystem_access")
-                        .target(DiagnosticTarget::new(DiagnosticTargetKind::File, ".env"))
-                        .expected(json!({"readable": true})),
-                )
-                .next_check(DiagnosticNextCheck::new("retry_request"))
-                .execution(DiagnosticExecution::new(
-                    true,
-                    DiagnosticWriteOutcome::NotStarted,
-                    DiagnosticRetry::SafeNow,
-                ))
-            }
+            Self::Io(error) => DiagnosticDetails::new(
+                DiagnosticCategory::Filesystem,
+                DiagnosticStage::RequestWrite,
+            )
+            .operation(operation)
+            .owner(
+                DiagnosticOwner::new(component)
+                    .path("src/config.rs")
+                    .symbol("filesystem operation"),
+            )
+            .expected(json!({"filesystem_operation": "complete successfully"}))
+            .observed(json!({"io_error_kind": error.kind().to_string()}))
+            .evidence(
+                DiagnosticEvidence::new("io_error")
+                    .summary("Filesystem error details were reduced to the error kind")
+                    .data(json!({"io_error_kind": error.kind().to_string()})),
+            )
+            .target(DiagnosticTarget::new(DiagnosticTargetKind::File, ".env"))
+            .next_check(
+                DiagnosticNextCheck::new("check_filesystem_access")
+                    .target(DiagnosticTarget::new(DiagnosticTargetKind::File, ".env"))
+                    .expected(json!({"readable": true})),
+            )
+            .next_check(DiagnosticNextCheck::new("retry_request"))
+            .execution(DiagnosticExecution::new(
+                true,
+                DiagnosticWriteOutcome::NotStarted,
+                DiagnosticRetry::SafeNow,
+            )),
         }
     }
 
@@ -644,7 +676,6 @@ impl AppError {
     }
 }
 
-
 impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         let dotenv = Dotenv::load(dotenv_target());
@@ -678,7 +709,9 @@ impl Config {
         let embed_dimension = configured_value("SOLARISAEL_EMBED_DIMENSION", &dotenv)
             .unwrap_or_else(|| EMBED_DIMENSION.to_string())
             .parse()
-            .map_err(|_| AppError::Config("SOLARISAEL_EMBED_DIMENSION must be an integer".into()))?;
+            .map_err(|_| {
+                AppError::Config("SOLARISAEL_EMBED_DIMENSION must be an integer".into())
+            })?;
         if embed_dimension != EMBED_DIMENSION {
             return Err(AppError::Config(
                 "embedding dimension must be 2048 for migration 0002".into(),
@@ -718,9 +751,7 @@ impl Config {
                 )
             })?;
         if shape != "vector(2048)" {
-            return Err(AppError::Config(
-                "incompatible embedding schema".into(),
-            ));
+            return Err(AppError::Config("incompatible embedding schema".into()));
         }
         Ok(pool)
     }

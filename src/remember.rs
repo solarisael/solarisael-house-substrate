@@ -6,7 +6,8 @@ use chrono::{Local, NaiveDate};
 use reqwest::Client;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
-use sqlx::PgPool;
+use serde_json::Value;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::{collections::BTreeSet, time::Duration};
 use uuid::Uuid;
 
@@ -197,10 +198,68 @@ pub async fn remember(
         return remember_lesson(pool, cfg, &req).await;
     }
     let source_path = req.source_path();
-    let threads = normalize_threads(&req.threads);
-    let primary_date = Local::now().date_naive();
-    let dates = derive_dates(&source_path, primary_date);
-    let chunks = chunk_body(&req.body);
+    let mut prepared = prepare_memory_write(
+        cfg,
+        &source_path,
+        &req.body,
+        &req.threads,
+        Local::now().date_naive(),
+    )
+    .await?;
+    let mut warnings = std::mem::take(&mut prepared.warnings);
+    let meta = serde_json::json!({
+        "origin": "direct-db-write",
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let mut tx = pool.begin().await?;
+    let memory_id = write_memory_tx(
+        &mut tx,
+        &req.room,
+        &req.title,
+        &source_path,
+        &req.body,
+        &req.supersedes,
+        meta,
+        &prepared,
+    )
+    .await?;
+    tx.commit().await?;
+    if req.backup
+        && let Err(error) = backup::run_post_write(pool, &cfg.database_url).await
+    {
+        warnings.push(format!("backup failed: {error}"));
+    }
+    Ok(RememberReceipt {
+        memory_id,
+        lesson_id: 0,
+        kind: "memory".into(),
+        room: req.room,
+        source_path,
+        durable: true,
+        authority: "postgres",
+        warnings,
+    })
+}
+
+pub(crate) struct PreparedMemoryWrite {
+    primary_date: NaiveDate,
+    dates: Vec<NaiveDate>,
+    threads: Vec<String>,
+    chunks: Vec<(String, usize, usize, Option<String>)>,
+    vectors: Option<Vec<Vec<f32>>>,
+    warnings: Vec<String>,
+}
+
+pub(crate) async fn prepare_memory_write(
+    cfg: &Config,
+    source_path: &str,
+    body: &str,
+    threads: &[String],
+    primary_date: NaiveDate,
+) -> Result<PreparedMemoryWrite, AppError> {
+    let threads = normalize_threads(threads);
+    let dates = derive_dates(source_path, primary_date);
+    let chunks = chunk_body(body);
     let mut warnings = Vec::new();
     let vectors = if cfg.test_embedding_disabled {
         warnings.push("semantic embeddings disabled; lexical chunks retained".into());
@@ -223,71 +282,187 @@ pub async fn remember(
         }
         Some(vectors)
     };
-    let mut tx = pool.begin().await?;
-    let meta = serde_json::json!({"origin":"direct-db-write", "recorded_at": chrono::Utc::now().to_rfc3339()});
-    let memory_id: i64 = sqlx::query_scalar(r#"INSERT INTO memories (room,type,date,dates,title,source_path,body,threads,meta) VALUES ($1,'memory',$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (room,source_path) DO UPDATE SET type='memory',date=EXCLUDED.date,dates=EXCLUDED.dates,title=EXCLUDED.title,body=EXCLUDED.body,threads=EXCLUDED.threads,meta=EXCLUDED.meta RETURNING id"#)
-        .bind(&req.room).bind(primary_date).bind(&dates).bind(&req.title).bind(&source_path).bind(&req.body).bind(&threads).bind(meta).fetch_one(&mut *tx).await?;
+    Ok(PreparedMemoryWrite {
+        primary_date,
+        dates,
+        threads,
+        chunks,
+        vectors,
+        warnings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_memory_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: &str,
+    title: &str,
+    source_path: &str,
+    body: &str,
+    supersedes: &[i64],
+    meta: Value,
+    prepared: &PreparedMemoryWrite,
+) -> Result<i64, AppError> {
+    let memory_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memories
+         (room,type,date,dates,title,source_path,body,threads,meta)
+         VALUES ($1,'memory',$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (room,source_path) DO UPDATE
+         SET type='memory',date=EXCLUDED.date,dates=EXCLUDED.dates,title=EXCLUDED.title,
+             body=EXCLUDED.body,threads=EXCLUDED.threads,meta=EXCLUDED.meta
+         RETURNING id",
+    )
+    .bind(room)
+    .bind(prepared.primary_date)
+    .bind(&prepared.dates)
+    .bind(title)
+    .bind(source_path)
+    .bind(body)
+    .bind(&prepared.threads)
+    .bind(meta)
+    .fetch_one(&mut **tx)
+    .await?;
     sqlx::query("DELETE FROM memory_threads WHERE memory_id=$1")
         .bind(memory_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    for thread in &threads {
+    for thread in &prepared.threads {
         sqlx::query("INSERT INTO memory_threads (memory_id,thread_key) VALUES ($1,$2)")
             .bind(memory_id)
             .bind(thread)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-    for old_id in req.supersedes.iter().copied().collect::<BTreeSet<_>>() {
+    for old_id in supersedes.iter().copied().collect::<BTreeSet<_>>() {
         sqlx::query("UPDATE memories SET superseded_by=$1 WHERE id=$2 AND id<>$1")
             .bind(memory_id)
             .bind(old_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
     sqlx::query("DELETE FROM memory_chunks WHERE memory_id=$1")
         .bind(memory_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    for (idx, (text, start, end, heading)) in chunks.iter().enumerate() {
-        let vector_text = vectors.as_ref().map(|vectors| {
+    for (index, (text, start, end, heading)) in prepared.chunks.iter().enumerate() {
+        let vector_text = prepared.vectors.as_ref().map(|vectors| {
             format!(
                 "[{}]",
-                vectors[idx]
+                vectors[index]
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",")
             )
         });
-        sqlx::query("INSERT INTO memory_chunks (memory_id,chunk_index,heading_path,body,char_start,char_end,token_estimate,body_embedding,embedded_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,CASE WHEN $8 IS NULL THEN NULL ELSE NOW() END)")
-            .bind(memory_id)
-            .bind(idx as i32)
-            .bind(heading)
-            .bind(text)
-            .bind(*start as i32)
-            .bind(*end as i32)
-            .bind(token_estimate(text))
-            .bind(vector_text)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO memory_chunks
+             (memory_id,chunk_index,heading_path,body,char_start,char_end,token_estimate,
+              body_embedding,embedded_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,
+                     CASE WHEN $8 IS NULL THEN NULL ELSE NOW() END)",
+        )
+        .bind(memory_id)
+        .bind(
+            i32::try_from(index)
+                .map_err(|_| AppError::Invalid("memory has too many semantic chunks".into()))?,
+        )
+        .bind(heading)
+        .bind(text)
+        .bind(
+            i32::try_from(*start).map_err(|_| {
+                AppError::Invalid("memory chunk range exceeds database bounds".into())
+            })?,
+        )
+        .bind(
+            i32::try_from(*end).map_err(|_| {
+                AppError::Invalid("memory chunk range exceeds database bounds".into())
+            })?,
+        )
+        .bind(token_estimate(text))
+        .bind(vector_text)
+        .execute(&mut **tx)
+        .await?;
     }
-    tx.commit().await?;
-    if req.backup
-        && let Err(error) = backup::run_post_write(pool, &cfg.database_url).await
-    {
-        warnings.push(format!("backup failed: {error}"));
-    }
-    Ok(RememberReceipt {
-        memory_id,
-        lesson_id: 0,
-        kind: "memory".into(),
-        room: req.room,
-        source_path,
-        durable: true,
-        authority: "postgres",
-        warnings,
-    })
+    Ok(memory_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_coding_lesson_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &str,
+    project: Option<&str>,
+    voice: Option<&str>,
+    shape: Option<&str>,
+    title: &str,
+    lesson: &str,
+    trigger_context: Option<&str>,
+    proof_pattern: Option<&str>,
+    tags: &[String],
+    source_memory_path: Option<&str>,
+    meta: Value,
+) -> Result<i64, AppError> {
+    sqlx::query_scalar(
+        "INSERT INTO coding_lessons
+         (scope,project,voice,shape,title,lesson,trigger_context,proof_pattern,tags,
+          source_memory_path,meta)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (scope,project,title) DO UPDATE
+         SET project=EXCLUDED.project,voice=EXCLUDED.voice,shape=EXCLUDED.shape,
+             lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,
+             proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,
+             source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta
+         RETURNING id",
+    )
+    .bind(scope)
+    .bind(project)
+    .bind(voice)
+    .bind(shape)
+    .bind(title)
+    .bind(lesson)
+    .bind(trigger_context)
+    .bind(proof_pattern)
+    .bind(tags)
+    .bind(source_memory_path)
+    .bind(meta)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_project_lesson_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project: &str,
+    title: &str,
+    lesson: &str,
+    trigger_context: Option<&str>,
+    proof_pattern: Option<&str>,
+    tags: &[String],
+    source_memory_path: Option<&str>,
+    meta: Value,
+) -> Result<i64, AppError> {
+    sqlx::query_scalar(
+        "INSERT INTO project_lessons
+         (project,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (project,title) DO UPDATE
+         SET lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,
+             proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,
+             source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta
+         RETURNING id",
+    )
+    .bind(project)
+    .bind(title)
+    .bind(lesson)
+    .bind(trigger_context)
+    .bind(proof_pattern)
+    .bind(tags)
+    .bind(source_memory_path)
+    .bind(meta)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
 }
 
 async fn remember_lesson(
@@ -303,13 +478,40 @@ async fn remember_lesson(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let meta = serde_json::json!({"origin":"direct-db-write", "kind": req.kind, "recorded_at": chrono::Utc::now().to_rfc3339()});
+    let meta = serde_json::json!({
+        "origin": "direct-db-write",
+        "kind": req.kind,
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+    });
     let mut tx = pool.begin().await?;
     let id = match req.kind.as_str() {
-        "coding-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO coding_lessons (scope,project,voice,shape,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (scope,project,title) DO UPDATE SET project=EXCLUDED.project,voice=EXCLUDED.voice,shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
-            .bind(req.scope.as_deref().unwrap_or("shared")).bind(&req.project).bind(&req.voice).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&req.proof_pattern).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
-        "project-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO project_lessons (project,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (project,title) DO UPDATE SET lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
-            .bind(req.project.as_deref().unwrap()).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&req.proof_pattern).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "coding-lesson" => write_coding_lesson_tx(
+            &mut tx,
+            req.scope.as_deref().unwrap_or("shared"),
+            req.project.as_deref(),
+            req.voice.as_deref(),
+            req.shape.as_deref(),
+            &req.title,
+            text,
+            req.trigger_context.as_deref(),
+            req.proof_pattern.as_deref(),
+            &tags,
+            req.source_memory_path.as_deref(),
+            meta,
+        )
+        .await?,
+        "project-lesson" => write_project_lesson_tx(
+            &mut tx,
+            req.project.as_deref().unwrap(),
+            &req.title,
+            text,
+            req.trigger_context.as_deref(),
+            req.proof_pattern.as_deref(),
+            &tags,
+            req.source_memory_path.as_deref(),
+            meta,
+        )
+        .await?,
         "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO writing_lessons (voice,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (voice,title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
             .bind(req.voice.as_deref().unwrap_or("general")).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO audio_lessons (shape,title,lesson,trigger_context,tags,source_memory_path) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path RETURNING id")

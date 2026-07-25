@@ -2,6 +2,8 @@ mod anamnesis;
 pub mod backup;
 mod cluster;
 mod config;
+mod giga;
+mod giga_worker;
 mod recall;
 mod remember;
 
@@ -15,6 +17,11 @@ pub use cluster::{
     cluster_maintenance, cluster_staleness, spherical_kmeans,
 };
 pub use config::{AppError, Config};
+pub use giga::{
+    giga_candidate_list, giga_candidate_store, giga_event_claim, giga_event_finish,
+    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_review,
+};
+pub use giga_worker::giga_process;
 pub use recall::{RecallParams, RecallResult, recall};
 pub use remember::{RememberReceipt, RememberRequest, remember};
 

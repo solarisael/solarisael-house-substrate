@@ -3,12 +3,15 @@ use house_core::{
     AnamnesisAddRequest as DomainAnamnesisAddRequest,
     AnamnesisAppendRequest as DomainAnamnesisAppendRequest,
     AnamnesisReadRequest as DomainAnamnesisReadRequest,
-    ClusterMaintenanceRequest as DomainClusterMaintenanceRequest,
-    RecallRequest as DomainRecallRequest, RememberRequest as DomainRememberRequest,
+    ClusterMaintenanceRequest as DomainClusterMaintenanceRequest, GigaEvent, GigaEventClaimRequest,
+    GigaEventFinishRequest, GigaEventReplayRequest, GigaProcessRequest, GigaPromotionRequest,
+    GigaReviewAction, RecallRequest as DomainRecallRequest,
+    RememberRequest as DomainRememberRequest,
 };
 use house_protocol::{
-    PROTOCOL_VERSION, ProtocolError, ProtocolErrorBody, RequestEnvelope, ResponseEnvelope,
-    ResponsePayload, success,
+    GigaCandidateListRequest, GigaEventClaimResult, GigaEventFinishResult, GigaEventReplayResult,
+    GigaHealthRequest, GigaPromoteResult, PROTOCOL_VERSION, ProtocolError, ProtocolErrorBody,
+    RequestEnvelope, ResponseEnvelope, ResponsePayload, success,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -17,7 +20,9 @@ use solarisael_house_substrate::backup::{
 };
 use solarisael_house_substrate::{
     AnamnesisParams, AnamnesisSeed, AnamnesisWrite, AppError, Config, RecallParams,
-    RememberRequest, anamnesis, anamnesis_write, cluster_maintenance, recall, remember,
+    RememberRequest, anamnesis, anamnesis_write, cluster_maintenance, giga_candidate_list,
+    giga_event_claim, giga_event_finish, giga_event_ingest, giga_event_replay, giga_health,
+    giga_process, giga_promote, giga_review, recall, remember,
 };
 use std::{
     env,
@@ -33,6 +38,15 @@ enum ProtocolRequest {
     Anamnesis(AnamnesisParams),
     AnamnesisWrite(AnamnesisWrite),
     Cluster(DomainClusterMaintenanceRequest),
+    GigaEvent(GigaEvent),
+    GigaProcess(GigaProcessRequest),
+    GigaEventClaim(GigaEventClaimRequest),
+    GigaEventFinish(GigaEventFinishRequest),
+    GigaEventReplay(GigaEventReplayRequest),
+    GigaPromote(GigaPromotionRequest),
+    GigaCandidateList(GigaCandidateListRequest),
+    GigaReview(GigaReviewAction),
+    GigaHealth(GigaHealthRequest),
 }
 
 fn invalid_params(message: impl Into<String>) -> ProtocolError {
@@ -224,6 +238,33 @@ fn decode_line(line: &str) -> (String, Result<ProtocolRequest, ProtocolError>) {
             ))),
             None => Err(invalid_params("anamnesis_write requires operation")),
         },
+        "giga_event_ingest" => envelope
+            .giga_event_ingest_request()
+            .map(ProtocolRequest::GigaEvent),
+        "giga_process" => envelope
+            .giga_process_request()
+            .map(ProtocolRequest::GigaProcess),
+        "giga_event_claim" => envelope
+            .giga_event_claim_request()
+            .map(ProtocolRequest::GigaEventClaim),
+        "giga_event_finish" => envelope
+            .giga_event_finish_request()
+            .map(ProtocolRequest::GigaEventFinish),
+        "giga_event_replay" => envelope
+            .giga_event_replay_request()
+            .map(ProtocolRequest::GigaEventReplay),
+        "giga_promote" => envelope
+            .giga_promote_request()
+            .map(ProtocolRequest::GigaPromote),
+        "giga_candidate_list" => envelope
+            .giga_candidate_list_request()
+            .map(ProtocolRequest::GigaCandidateList),
+        "giga_review" => envelope
+            .giga_review_request()
+            .map(ProtocolRequest::GigaReview),
+        "giga_health" => envelope
+            .giga_health_request()
+            .map(ProtocolRequest::GigaHealth),
         "cluster_maintenance" => envelope
             .cluster_maintenance_request()
             .map(ProtocolRequest::Cluster),
@@ -392,12 +433,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ProtocolRequest::Anamnesis(_) => "anamnesis",
                     ProtocolRequest::AnamnesisWrite(_) => "anamnesis_write",
                     ProtocolRequest::Cluster(_) => "cluster_maintenance",
+                    ProtocolRequest::GigaEvent(_) => "giga_event_ingest",
+                    ProtocolRequest::GigaProcess(_) => "giga_process",
+                    ProtocolRequest::GigaEventClaim(_) => "giga_event_claim",
+                    ProtocolRequest::GigaEventFinish(_) => "giga_event_finish",
+                    ProtocolRequest::GigaEventReplay(_) => "giga_event_replay",
+                    ProtocolRequest::GigaPromote(_) => "giga_promote",
+                    ProtocolRequest::GigaCandidateList(_) => "giga_candidate_list",
+                    ProtocolRequest::GigaReview(_) => "giga_review",
+                    ProtocolRequest::GigaHealth(_) => "giga_health",
                 };
                 let validation = match &request {
                     ProtocolRequest::Remember(request) => request.validate(),
                     ProtocolRequest::Recall(request) => request.validate(),
                     ProtocolRequest::Anamnesis(request) => request.validate().map(|_| ()),
-                    ProtocolRequest::AnamnesisWrite(_) | ProtocolRequest::Cluster(_) => Ok(()),
+                    ProtocolRequest::AnamnesisWrite(_)
+                    | ProtocolRequest::Cluster(_)
+                    | ProtocolRequest::GigaEvent(_)
+                    | ProtocolRequest::GigaProcess(_)
+                    | ProtocolRequest::GigaEventClaim(_)
+                    | ProtocolRequest::GigaEventFinish(_)
+                    | ProtocolRequest::GigaEventReplay(_)
+                    | ProtocolRequest::GigaPromote(_)
+                    | ProtocolRequest::GigaCandidateList(_)
+                    | ProtocolRequest::GigaReview(_)
+                    | ProtocolRequest::GigaHealth(_) => Ok(()),
                 };
                 if let Err(error) = validation {
                     app_error(id, operation, error)
@@ -457,6 +517,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .await
                                 {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaEvent(request) => {
+                                match giga_event_ingest(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaProcess(request) => {
+                                match giga_process(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaEventClaim(request) => {
+                                match giga_event_claim(pool, request).await {
+                                    Ok(result) => {
+                                        success_json(id, GigaEventClaimResult::from(result))?
+                                    }
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaEventFinish(request) => {
+                                match giga_event_finish(pool, request).await {
+                                    Ok(result) => {
+                                        success_json(id, GigaEventFinishResult::from(result))?
+                                    }
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaEventReplay(request) => {
+                                match giga_event_replay(pool, request).await {
+                                    Ok(result) => {
+                                        success_json(id, GigaEventReplayResult::from(result))?
+                                    }
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaPromote(request) => {
+                                match giga_promote(pool, config, request).await {
+                                    Ok(result) => {
+                                        success_json(id, GigaPromoteResult::from(result))?
+                                    }
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaCandidateList(request) => {
+                                match giga_candidate_list(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaReview(request) => {
+                                match giga_review(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaHealth(request) => {
+                                match giga_health(pool, request).await {
                                     Ok(result) => success_json(id, result)?,
                                     Err(error) => app_error(id, operation, error),
                                 }
