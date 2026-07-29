@@ -19,7 +19,8 @@ pub use cluster::{
 pub use config::{AppError, Config};
 pub use giga::{
     giga_candidate_list, giga_candidate_store, giga_event_claim, giga_event_finish,
-    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_review,
+    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_queue_maintenance,
+    giga_review,
 };
 pub use giga_worker::giga_process;
 pub use recall::{RecallParams, RecallResult, recall};

@@ -5,7 +5,7 @@ use house_core::{
     AnamnesisReadRequest as DomainAnamnesisReadRequest,
     ClusterMaintenanceRequest as DomainClusterMaintenanceRequest, GigaEvent, GigaEventClaimRequest,
     GigaEventFinishRequest, GigaEventReplayRequest, GigaProcessRequest, GigaPromotionRequest,
-    GigaReviewAction, RecallRequest as DomainRecallRequest,
+    GigaQueueMaintenanceRequest, GigaReviewAction, RecallRequest as DomainRecallRequest,
     RememberRequest as DomainRememberRequest,
 };
 use house_protocol::{
@@ -20,10 +20,10 @@ use solarisael_house_substrate::backup::{
 };
 use solarisael_house_substrate::{
     AnamnesisParams, AnamnesisSeed, AnamnesisWrite, AppError, Config, RecallParams,
-    RememberRequest, ThreadContinuation as ServiceThreadContinuation, anamnesis,
-    anamnesis_write, cluster_maintenance, giga_candidate_list, giga_event_claim,
-    giga_event_finish, giga_event_ingest, giga_event_replay, giga_health, giga_process,
-    giga_promote, giga_review, recall, remember,
+    RememberRequest, ThreadContinuation as ServiceThreadContinuation, anamnesis, anamnesis_write,
+    cluster_maintenance, giga_candidate_list, giga_event_claim, giga_event_finish,
+    giga_event_ingest, giga_event_replay, giga_health, giga_process, giga_promote,
+    giga_queue_maintenance, giga_review, recall, remember,
 };
 use std::{
     env,
@@ -44,6 +44,7 @@ enum ProtocolRequest {
     GigaEventClaim(GigaEventClaimRequest),
     GigaEventFinish(GigaEventFinishRequest),
     GigaEventReplay(GigaEventReplayRequest),
+    GigaQueueMaintenance(GigaQueueMaintenanceRequest),
     GigaPromote(GigaPromotionRequest),
     GigaCandidateList(GigaCandidateListRequest),
     GigaReview(GigaReviewAction),
@@ -269,6 +270,9 @@ fn decode_line(line: &str) -> (String, Result<ProtocolRequest, ProtocolError>) {
         "giga_event_replay" => envelope
             .giga_event_replay_request()
             .map(ProtocolRequest::GigaEventReplay),
+        "giga_queue_maintenance" => envelope
+            .giga_queue_maintenance_request()
+            .map(ProtocolRequest::GigaQueueMaintenance),
         "giga_promote" => envelope
             .giga_promote_request()
             .map(ProtocolRequest::GigaPromote),
@@ -454,6 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ProtocolRequest::GigaEventClaim(_) => "giga_event_claim",
                     ProtocolRequest::GigaEventFinish(_) => "giga_event_finish",
                     ProtocolRequest::GigaEventReplay(_) => "giga_event_replay",
+                    ProtocolRequest::GigaQueueMaintenance(_) => "giga_queue_maintenance",
                     ProtocolRequest::GigaPromote(_) => "giga_promote",
                     ProtocolRequest::GigaCandidateList(_) => "giga_candidate_list",
                     ProtocolRequest::GigaReview(_) => "giga_review",
@@ -470,6 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | ProtocolRequest::GigaEventClaim(_)
                     | ProtocolRequest::GigaEventFinish(_)
                     | ProtocolRequest::GigaEventReplay(_)
+                    | ProtocolRequest::GigaQueueMaintenance(_)
                     | ProtocolRequest::GigaPromote(_)
                     | ProtocolRequest::GigaCandidateList(_)
                     | ProtocolRequest::GigaReview(_)
@@ -570,6 +576,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(result) => {
                                         success_json(id, GigaEventReplayResult::from(result))?
                                     }
+                                    Err(error) => app_error(id, operation, error),
+                                }
+                            }
+                            ProtocolRequest::GigaQueueMaintenance(request) => {
+                                match giga_queue_maintenance(pool, request).await {
+                                    Ok(result) => success_json(id, result)?,
                                     Err(error) => app_error(id, operation, error),
                                 }
                             }

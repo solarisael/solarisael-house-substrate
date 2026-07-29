@@ -184,6 +184,7 @@ fn is_write_operation(operation: &str) -> bool {
             | "giga_event_claim"
             | "giga_event_finish"
             | "giga_event_replay"
+            | "giga_queue_maintenance"
             | "giga_promote"
             | "giga_review"
     )
@@ -201,6 +202,7 @@ fn validation_owner(operation: &str) -> (&'static str, &'static str) {
         "giga_event_claim" => ("src/giga.rs", "giga_event_claim"),
         "giga_event_finish" => ("src/giga.rs", "giga_event_finish"),
         "giga_event_replay" => ("src/giga.rs", "giga_event_replay"),
+        "giga_queue_maintenance" => ("src/giga.rs", "giga_queue_maintenance"),
         "giga_promote" => ("src/giga.rs", "giga_promote"),
         "giga_candidate_list" => ("src/giga.rs", "giga_candidate_list"),
         "giga_review" => ("src/giga.rs", "giga_review"),
@@ -241,6 +243,7 @@ fn database_owner(operation: &str) -> (&'static str, &'static str) {
         "giga_event_claim" => ("src/giga.rs", "giga_event_claim"),
         "giga_event_finish" => ("src/giga.rs", "giga_event_finish"),
         "giga_event_replay" => ("src/giga.rs", "giga_event_replay"),
+        "giga_queue_maintenance" => ("src/giga.rs", "giga_queue_maintenance"),
         "giga_promote" => ("src/giga.rs", "giga_promote"),
         "giga_candidate_list" => ("src/giga.rs", "giga_candidate_list"),
         "giga_review" => ("src/giga.rs", "giga_review"),

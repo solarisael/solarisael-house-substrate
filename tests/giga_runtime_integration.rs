@@ -4,6 +4,7 @@ use house_core::{
     GigaEventFinishRequest, GigaEventReplayRequest, GigaEventType, GigaLifecycle,
     GigaMemoryPromotionPayload, GigaProjectLessonPromotionPayload, GigaPromotionAuthority,
     GigaPromotionKind, GigaPromotionPayload, GigaPromotionRequest, GigaPublicationConsent,
+    GigaQueueMaintenanceOperation, GigaQueueMaintenanceRequest, GigaQueueMaintenanceScope,
     GigaQueueState, GigaResonance, GigaReviewAction, GigaReviewState, GigaScope, GigaScores,
     GigaSourceRef, GigaSourceType, GigaVisibility, RoomKey,
 };
@@ -11,7 +12,8 @@ use house_protocol::{GigaCandidateListParams, GigaHealthParams};
 use serde_json::Value;
 use solarisael_house_substrate::{
     Config, giga_candidate_list, giga_candidate_store, giga_event_claim, giga_event_finish,
-    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_review,
+    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_queue_maintenance,
+    giga_review,
 };
 use sqlx::{
     PgPool, Row,
@@ -421,6 +423,147 @@ async fn queue_contracts(pool: &PgPool) -> TestResult {
     require(
         replay_generation_attempts == 1,
         "new replay attempts must be separate from retained prior history",
+    )
+}
+async fn queue_maintenance_contracts(pool: &PgPool) -> TestResult {
+    ingest_queue_event(pool, "maintenance-pending").await?;
+
+    ingest_queue_event(pool, "maintenance-failed").await?;
+    let failed = giga_event_claim(pool, claim_request("maintenance-failed-worker", 60)?).await?;
+    require(
+        failed.event().map(GigaEvent::event_id) == Some("maintenance-failed"),
+        "failed fixture must be claimed",
+    )?;
+    giga_event_finish(
+        pool,
+        finish_request(
+            "maintenance-failed",
+            "maintenance-failed-worker",
+            GigaEventFinishOutcome::Failed,
+            Some("fixture_failure"),
+            None,
+        )?,
+    )
+    .await?;
+
+    ingest_queue_event(pool, "maintenance-expired").await?;
+    let expired = giga_event_claim(pool, claim_request("maintenance-expired-worker", 60)?).await?;
+    require(
+        expired.event().map(GigaEvent::event_id) == Some("maintenance-expired"),
+        "expired fixture must be claimed",
+    )?;
+    sqlx::query(
+        "UPDATE giga_events SET lease_expires_at=NOW()-INTERVAL '1 second'
+         WHERE event_id='maintenance-expired'",
+    )
+    .execute(pool)
+    .await?;
+
+    ingest_queue_event(pool, "maintenance-active").await?;
+    let active = giga_event_claim(pool, claim_request("maintenance-active-worker", 60)?).await?;
+    require(
+        active.event().map(GigaEvent::event_id) == Some("maintenance-active"),
+        "active fixture must be claimed",
+    )?;
+
+    ingest_queue_event(pool, "maintenance-succeeded").await?;
+    let succeeded =
+        giga_event_claim(pool, claim_request("maintenance-succeeded-worker", 60)?).await?;
+    require(
+        succeeded.event().map(GigaEvent::event_id) == Some("maintenance-succeeded"),
+        "succeeded fixture must be claimed",
+    )?;
+    giga_event_finish(
+        pool,
+        finish_request(
+            "maintenance-succeeded",
+            "maintenance-succeeded-worker",
+            GigaEventFinishOutcome::Succeeded,
+            None,
+            None,
+        )?,
+    )
+    .await?;
+
+    stage_candidate(
+        pool,
+        "maintenance-candidate",
+        GigaCandidateKind::Memory,
+        None,
+        false,
+        'b',
+    )
+    .await?;
+
+    let check = giga_queue_maintenance(
+        pool,
+        GigaQueueMaintenanceRequest::new(
+            RoomKey::new(ROOM)?,
+            GigaQueueMaintenanceOperation::Check,
+            GigaQueueMaintenanceScope::Room,
+        ),
+    )
+    .await?;
+    require(
+        check.eligible_events == 3
+            && check.blocked_events == 2
+            && check.deleted_events == 0
+            && check.deleted_attempts == 0
+            && check.preserved_candidates == 1
+            && check.before == check.after,
+        "maintenance check must report the exact purge boundary without mutating it",
+    )?;
+
+    let purge = giga_queue_maintenance(
+        pool,
+        GigaQueueMaintenanceRequest::new(
+            RoomKey::new(ROOM)?,
+            GigaQueueMaintenanceOperation::PurgeStuck,
+            GigaQueueMaintenanceScope::Room,
+        ),
+    )
+    .await?;
+    require(
+        purge.eligible_events == 3
+            && purge.blocked_events == 2
+            && purge.deleted_events == 3
+            && purge.deleted_attempts == 2
+            && purge.preserved_candidates == 1,
+        "purge must delete only discardable stuck events and their attempts",
+    )?;
+
+    for event_id in [
+        "maintenance-pending",
+        "maintenance-failed",
+        "maintenance-expired",
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM giga_events WHERE event_id=$1)")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await?;
+        require(!exists, format!("{event_id} must be deleted"))?;
+    }
+    for event_id in [
+        "maintenance-active",
+        "maintenance-succeeded",
+        "maintenance-candidate-event",
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM giga_events WHERE event_id=$1)")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await?;
+        require(exists, format!("{event_id} must be preserved"))?;
+    }
+    require(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM giga_candidates WHERE candidate_id='maintenance-candidate'",
+        )
+        .fetch_one(pool)
+        .await?
+            == 1,
+        "queue maintenance must preserve candidate state",
     )
 }
 
@@ -1346,6 +1489,7 @@ async fn queue_and_atomic_promotion_contracts() {
                 sqlx::raw_sql(include_str!("../migrations/0005_giga_resonance.sql"))
                     .execute(&pool)
                     .await?;
+                queue_maintenance_contracts(&pool).await?;
                 queue_contracts(&pool).await?;
                 review_resonance_and_room_scope_contracts(&pool).await?;
                 promotion_contracts(&pool, &cfg).await?;
