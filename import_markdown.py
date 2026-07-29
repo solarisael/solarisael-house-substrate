@@ -65,15 +65,18 @@ def extract_title(body: str, fallback: str) -> str:
 
 
 def build_threads_for_file(threads_index: dict) -> dict:
-    """Invert threads → {file_path: [(thread_key, lines, context), ...]}"""
+    """Invert threads → {file_path: [(thread_key, lines, context), ...]}."""
     by_file: dict[str, list] = defaultdict(list)
-    for thread_key, entries in threads_index.items():
-        for e in entries:
-            by_file[e["file"]].append(
+    for raw_thread, entries in threads_index.items():
+        thread = raw_thread.strip()
+        if not thread:
+            sys.exit("thread keys in index.json must be nonblank")
+        for entry in entries:
+            by_file[entry["file"]].append(
                 {
-                    "thread": thread_key,
-                    "lines": e.get("lines", []),
-                    "context": e.get("context", ""),
+                    "thread": thread,
+                    "lines": entry.get("lines", []),
+                    "context": entry.get("context", ""),
                 }
             )
     return by_file
@@ -107,7 +110,7 @@ def discover_files(room_root: Path, files_index: dict, *, include_unindexed: boo
 def upsert_memory(cur, *, room: str, source_path: str, body: str, title: str,
                   date_: date_t | None, type_: str, threads: list[str], meta: dict,
                   thread_refs: list[dict]) -> int:
-    """Upsert the memory row + rebuild its memory_threads pivot rows. Returns id."""
+    """Upsert a memory and its registry events and detailed refs. Returns id."""
     cur.execute(
         """
         INSERT INTO memories (room, type, date, title, source_path, body, threads, meta)
@@ -127,26 +130,69 @@ def upsert_memory(cur, *, room: str, source_path: str, body: str, title: str,
     )
     memory_id = cur.fetchone()[0]
 
-    # Rebuild pivot rows for this memory. Rows are derived from thread_refs;
-    # always clear-and-replace so re-imports stay idempotent.
-    cur.execute("DELETE FROM memory_threads WHERE memory_id = %s", (memory_id,))
-    if thread_refs:
-        cur.executemany(
+    # Upsert one registry event per distinct thread, then replace only its
+    # detailed refs. Repeated refs are intentionally retained.
+    refs_by_thread: dict[str, list[dict]] = defaultdict(list)
+    for ref in thread_refs:
+        refs_by_thread[ref["thread"]].append(ref)
+    event_ids: list[int] = []
+    for thread in threads:
+        cur.execute(
             """
-            INSERT INTO memory_threads (memory_id, thread_key, lines_start, lines_end, context)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO threads (room, thread_key)
+            VALUES (%s, %s)
+            ON CONFLICT (room, thread_key) DO UPDATE
+            SET thread_key = EXCLUDED.thread_key
+            RETURNING id
             """,
-            [
-                (
-                    memory_id,
-                    ref["thread"],
-                    (ref.get("lines") or [None, None])[0],
-                    (ref.get("lines") or [None, None])[1] if len(ref.get("lines") or []) >= 2 else None,
-                    ref.get("context", ""),
-                )
-                for ref in thread_refs
-            ],
+            (room, thread),
         )
+        thread_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO thread_events (thread_id, memory_id)
+            VALUES (%s, %s)
+            ON CONFLICT (thread_id, memory_id) DO UPDATE
+            SET memory_id = EXCLUDED.memory_id
+            RETURNING id
+            """,
+            (thread_id, memory_id),
+        )
+        event_id = cur.fetchone()[0]
+        event_ids.append(event_id)
+        cur.execute("DELETE FROM memory_thread_refs WHERE event_id = %s", (event_id,))
+        refs = refs_by_thread[thread]
+        if refs:
+            cur.executemany(
+                """
+                INSERT INTO memory_thread_refs
+                    (event_id, lines_start, lines_end, context)
+                VALUES (%s, %s, %s, %s)
+                """,
+                [
+                    (
+                        event_id,
+                        (ref.get("lines") or [None, None])[0],
+                        (ref.get("lines") or [None, None])[1]
+                        if len(ref.get("lines") or []) >= 2 else None,
+                        ref.get("context", ""),
+                    )
+                    for ref in refs
+                ],
+            )
+
+    if event_ids:
+        cur.execute(
+            "DELETE FROM thread_events "
+            "WHERE memory_id = %s AND NOT (id = ANY(%s))",
+            (memory_id, event_ids),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM thread_events WHERE memory_id = %s",
+            (memory_id,),
+        )
+
     return memory_id
 
 
@@ -184,7 +230,7 @@ def import_room(room: str, room_root: Path, *, dry_run: bool, include_unindexed:
                 body = full.read_text(encoding="utf-8")
                 title = extract_title(body, fallback=Path(rel).stem)
                 file_threads = by_file.get(rel, [])
-                thread_keys = sorted({t["thread"] for t in file_threads})
+                thread_keys = list(dict.fromkeys(t["thread"] for t in file_threads))
                 meta = {
                     "one_line": fmeta.get("one_line", ""),
                     "thread_refs": file_threads,  # preserve line ranges + contexts

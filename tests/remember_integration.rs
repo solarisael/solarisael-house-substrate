@@ -1,6 +1,7 @@
 use house_protocol::{ClusterMaintenanceResultWire, ResponseEnvelope};
 use solarisael_house_substrate::{
-    Config, RecallParams, RememberRequest, backup::source_migrations, recall, remember,
+    Config, RecallParams, RememberRequest, ThreadContinuation, backup::source_migrations, recall,
+    remember,
 };
 use sqlx::{
     PgPool,
@@ -118,6 +119,7 @@ async fn isolated_database_guard() {
             source_path: Some(source_path.clone()),
             source_memory_path: None,
             threads: vec!["integration".into()],
+            continues: vec![],
             supersedes: vec![],
             shape: None,
             voice: None,
@@ -179,6 +181,124 @@ async fn isolated_database_guard() {
         .execute(&pool)
         .await
         .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires SOLARISAEL_SUBSTRATE_TEST_DATABASE_URL and migrations through 0006"]
+async fn ordered_thread_write_surfaces_explicit_recall_neighbors() {
+    let url = isolated_database_url();
+    let options = PgConnectOptions::from_str(&url).expect("dedicated test URL must be valid");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .expect("isolated database must be reachable");
+    let cfg = Config {
+        database_url: url,
+        embed_url: None,
+        embed_model: "disabled".into(),
+        embed_dimension: 2048,
+        embed_required: false,
+        test_embedding_disabled: true,
+    };
+    let suffix = Uuid::new_v4();
+    let root_source = format!("thread-integration/{suffix}/root");
+    let next_source = format!("thread-integration/{suffix}/next");
+    let thread = "work / page";
+    let root = remember(
+        &pool,
+        &cfg,
+        RememberRequest {
+            room: "thread-continuity-integration".into(),
+            kind: "memory".into(),
+            title: "root decision".into(),
+            body: "The initial explicit work page decision.".into(),
+            lesson: None,
+            source_path: Some(root_source.clone()),
+            source_memory_path: None,
+            threads: vec![thread.into()],
+            continues: vec![],
+            supersedes: vec![],
+            shape: None,
+            voice: None,
+            scope: None,
+            project: None,
+            proof_pattern: None,
+            trigger_context: None,
+            tags: vec![],
+            backup: false,
+        },
+    )
+    .await
+    .expect("root memory must commit");
+    let next_body = "The successor work page decision explicitly continues the root.";
+    let next = remember(
+        &pool,
+        &cfg,
+        RememberRequest {
+            room: "thread-continuity-integration".into(),
+            kind: "memory".into(),
+            title: "successor decision".into(),
+            body: next_body.into(),
+            lesson: None,
+            source_path: Some(next_source.clone()),
+            source_memory_path: None,
+            threads: vec![thread.into()],
+            continues: vec![ThreadContinuation {
+                thread: thread.into(),
+                previous_memory_id: root.memory_id,
+            }],
+            supersedes: vec![],
+            shape: None,
+            voice: None,
+            scope: None,
+            project: None,
+            proof_pattern: None,
+            trigger_context: None,
+            tags: vec![],
+            backup: false,
+        },
+    )
+    .await
+    .expect("continuation memory must commit");
+
+    let recalled = recall(
+        &pool,
+        &cfg,
+        RecallParams {
+            room: "thread-continuity-integration".into(),
+            query: next_body.into(),
+            semantic_top_k: 1,
+            semantic_min_similarity: 0.5,
+            content_top_k: 8,
+            content_min_similarity: 0.3,
+            temporal_decay: false,
+        },
+    )
+    .await
+    .expect("recall must surface the explicit continuation");
+    let candidate = recalled
+        .retrieval_candidates
+        .iter()
+        .find(|candidate| candidate["memory_id"].as_i64() == Some(next.memory_id))
+        .expect("the successor must be surfaced as a fused recall candidate");
+    let neighbors = candidate["thread_neighbors"]
+        .as_array()
+        .expect("the surfaced successor must carry thread neighbor evidence");
+    assert!(neighbors.iter().any(|neighbor| {
+        neighbor["thread"].as_str() == Some(thread)
+            && neighbor["direction"].as_str() == Some("previous")
+            && neighbor["id"].as_i64() == Some(root.memory_id)
+            && neighbor["authority_state"].as_str() == Some("active")
+    }));
+
+    sqlx::query("DELETE FROM memories WHERE room=$1 AND source_path = ANY($2::text[])")
+        .bind("thread-continuity-integration")
+        .bind(vec![root_source, next_source])
+        .execute(&pool)
+        .await
+        .expect("thread integration memories must clean up");
     pool.close().await;
 }
 

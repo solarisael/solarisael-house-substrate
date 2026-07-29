@@ -116,6 +116,26 @@ The adapter must point `SOLARISAEL_HOUSE_RUST` at:
 C:\Projects\solarisael-house-substrate\target\release\solarisael-house-substrate.exe
 ```
 
+### Upgrade a running local installation
+
+Use the canonical PowerShell 7 deployment path instead of building over a
+locked live executable:
+
+```text
+cd C:\Projects\solarisael-house-substrate
+pwsh -File .\deploy-local.ps1
+```
+
+The script tests the Athanor core/protocol and substrate, builds a staged
+release, takes a PostgreSQL backup, stops only substrate workers running from
+the exact configured `SOLARISAEL_HOUSE_RUST` path, replaces that executable,
+applies ordered migrations, and requires a Full-mode health result. It restores
+the prior executable if migration fails.
+
+`-SkipTests` and `-SkipBackup` exist for diagnosed recovery only; the safe
+default performs both. Restart OMP once after success so its long-lived Rust
+transport and TypeScript tool schemas reload.
+
 Install and start Ollama in WSL.  Keep `ollama serve` running in one terminal
 and use another WSL terminal for the pull and substrate commands:
 
@@ -163,7 +183,7 @@ python3 health.py
 ```
 
 Health prints one JSON object.  It exits zero only for `mode: "full"`:
-required scripts, PostgreSQL, both extensions, schema version 1, and the
+required scripts, PostgreSQL, both extensions, schema version 6, and the
 configured embedding endpoint/dimension must all pass.  For database-only
 setup diagnostics, use `python3 health.py --skip-embedding`; that is not a
 AKASHA check.  `--timeout SECONDS` changes the embedding probe timeout.
@@ -187,6 +207,10 @@ the requested room.  `record_memory.py` accepts `--body-file` instead of
 `--supersedes`, `--canon-touches`, `--meta-kv`, and `--meta-bool`.  The embed
 pass also accepts `--rooms`, `--batch`, `--limit`, `--dry-run`, and
 `--env-file`.
+
+`--continues` accepts a repeatable JSON object with `thread` and
+`previousMemoryId`. The thread must also be present in `--thread`; continuation
+records chronology and never replaces `--supersedes` authority semantics.
 
 ## Typed writers and query CLIs
 

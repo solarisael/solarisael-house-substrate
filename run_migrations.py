@@ -54,6 +54,16 @@ def main() -> int:
             sql = migration.read_text(encoding="utf-8")
             with conn.cursor() as cur:
                 cur.execute(sql)
+                # Record it. This INSERT was missing outright: migrations were
+                # applied and never written down, so `applied` above could only
+                # ever be filled by some other writer, and every run re-applied
+                # everything. Same cursor and transaction as the migration body
+                # — a recorded migration is one that actually ran.
+                cur.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s) "
+                    "ON CONFLICT (version) DO NOTHING",
+                    (version,),
+                )
             print(f"applied {migration.name}")
     return 0
 

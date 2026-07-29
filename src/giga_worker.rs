@@ -12,8 +12,8 @@ use house_core::{
 };
 use house_protocol::{GigaClassifierHealthResult, GigaProcessResult, RequiredNullable};
 use reqwest::{RequestBuilder, Url};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
+use serde_json::{value::RawValue, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{env, sync::LazyLock, time::Duration};
@@ -29,7 +29,29 @@ const GIGA_LEASE_SECONDS: i64 = 300;
 const GIGA_RETRY_DELAY_SECONDS: u32 = 30;
 const GIGA_MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 const GIGA_MAX_OLLAMA_RESPONSE_BYTES: usize = 64 * 1024;
+const GIGA_MAX_MODEL_RATIONALE_BYTES: usize = 4 * 1024;
+const GIGA_MAX_STORED_RATIONALE_BYTES: usize = 1_200;
+const GIGA_RATIONALE_TRUNCATION_MARKER: &str =
+    "\n[truncated: classifier rationale is diagnostic, not evidence]";
 const GIGA_MAX_MESSAGE_BYTES: usize = 16 * 1024;
+// Measured on this box 2026-07-25: KV cache costs ~41 MB per 1k tokens for this
+// model (num_ctx 4096 -> 3.19 GB VRAM, 16384 -> 3.69 GB). 32768 lands near 4.4 GB
+// and sits comfortably beside the 2.1 GB embedder on a 16 GB card.
+//
+// 4096 was unusable and produced GigaClassifierOutputError on every large event:
+// the adapter may send up to GIGA_MAX_WINDOW_BYTES (24_000 bytes, roughly 6-7k
+// tokens) plus the system prompt plus 768 reserved output tokens, against a 4096
+// window. The two budgets contradicted each other. Proof that day: an 8-turn kodo
+// event failed three attempts while a 1-turn kintsu event succeeded first try.
+//
+// The headroom above the window is deliberate. Classification is meant to receive
+// retrieved neighbour memories so that `novelty` is measured against what the
+// House already holds rather than asserted by a model with no past.
+const GIGA_NUM_CTX: u32 = 32_768;
+// Ollama defaults to a 5 minute keep_alive, which evicted both models during idle
+// gaps and charged a cold reload on the next turn. Lower this if the card is
+// needed elsewhere; residency is a comfort setting, not a correctness one.
+const GIGA_KEEP_ALIVE: &str = "30m";
 const GIGA_MAX_SELECTED_SOURCES: usize = 4;
 const GIGA_MAX_RETRIEVAL_TERMS: usize = 8;
 const GIGA_MAX_DIAGNOSTIC_CLASS_BYTES: usize = 128;
@@ -63,13 +85,13 @@ pub const GIGA_GATE_PROMPT: &str = concat!(
 pub const GIGA_EXTRACTION_PROMPT: &str = concat!(
     "You are Hippocampus's second-pass candidate extractor. The durability gate already chose ",
     "one candidate kind and exact supporting turns. Produce one compact source-grounded candidate ",
-    "proposal. Generated title, gist, rationale, scores, and retrieval terms are navigation aids, ",
-    "never authority. Preserve the human meaning and voice without clinicalizing intimacy. Do not ",
+    "proposal. Generated title, rationale, gist, scores, and retrieval terms are navigation aids, ",
+    "never authority or evidence. Preserve the human meaning and voice without clinicalizing intimacy. Do not ",
     "invent facts, project keys, targets, entities, threads, or source IDs. Lessons must state a ",
     "reusable rule and observed proof. Corrections must describe what reading was corrected. ",
     "Supersessions must describe old and new state but must not claim that the old record was ",
     "already changed. Use the minimal exact source IDs. Every numeric score must be finite and ",
-    "between 0.0 and 1.0 inclusive. Do not emit reasoning outside the JSON."
+    "between 0.0 and 1.0 inclusive. Put classifier reasoning in rationale; do not emit reasoning outside JSON."
 );
 
 static GIGA_WORKER_ID: LazyLock<String> =
@@ -159,8 +181,8 @@ struct ExtractionOutput {
     source_ids: Vec<String>,
     proof_source_ids: Vec<String>,
     proposed_title: String,
-    gist: String,
     rationale: String,
+    gist: String,
     priority: f64,
     novelty: f64,
     durability: f64,
@@ -196,6 +218,8 @@ pub(crate) fn giga_classifier_enabled() -> bool {
 
 pub(crate) fn giga_classifier_health(
     last_error_class: Option<String>,
+    last_error_at: Option<String>,
+    consecutive_failures: u64,
 ) -> GigaClassifierHealthResult {
     let raw = env::var("SOLARISAEL_HIPPOCAMPUS_OLLAMA_ENDPOINT")
         .unwrap_or_else(|_| GIGA_DEFAULT_OLLAMA_ENDPOINT.into());
@@ -215,7 +239,10 @@ pub(crate) fn giga_classifier_health(
         model_digest: GIGA_MODEL_MANIFEST_DIGEST.into(),
         prompt_version: GIGA_PROMPT_VERSION.into(),
         endpoint_scope: endpoint_scope.into(),
+        // This is historical sticky context; consecutive_failures is the live signal.
         last_error_class: RequiredNullable(safe_error_class(last_error_class)),
+        last_error_at: RequiredNullable(last_error_at),
+        consecutive_failures,
     }
 }
 
@@ -344,69 +371,161 @@ fn gate_schema(source_ids: &[String]) -> Value {
                 "uniqueItems": true,
                 "items": { "type": "string", "enum": source_ids }
             },
-            "reason": { "type": "string", "minLength": 1, "maxLength": 160 }
+            "reason": { "type": "string", "minLength": 1 }
         }
     })
 }
 
-fn extraction_schema(source_ids: &[String], proof_required: bool) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "source_ids", "proof_source_ids", "proposed_title", "gist", "rationale",
-            "priority", "novelty", "durability", "confidence", "retrieval_terms"
+// Ollama 0.32.4 rejects maxLength during JSON-Schema-to-GBNF conversion. Keep
+// wire schemas shape-focused; bounded_trimmed and truncate_with_marker enforce limits locally.
+#[derive(Serialize)]
+struct OrderedExtractionSchema {
+    #[serde(rename = "type")]
+    schema_type: &'static str,
+    #[serde(rename = "additionalProperties")]
+    additional_properties: bool,
+    required: [&'static str; 10],
+    properties: OrderedExtractionProperties,
+}
+
+struct OrderedExtractionProperties {
+    source_ids: Value,
+    proof_source_ids: Value,
+    proposed_title: Value,
+    rationale: Value,
+    gist: Value,
+    priority: Value,
+    novelty: Value,
+    durability: Value,
+    confidence: Value,
+    retrieval_terms: Value,
+}
+
+impl Serialize for OrderedExtractionProperties {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Keep this ordering local: serde_json::preserve_order would alter every
+        // Value serialization, including the hash inputs used for GIGA identity.
+        let mut properties = serializer.serialize_map(Some(10))?;
+        properties.serialize_entry("source_ids", &self.source_ids)?;
+        properties.serialize_entry("proof_source_ids", &self.proof_source_ids)?;
+        properties.serialize_entry("proposed_title", &self.proposed_title)?;
+        properties.serialize_entry("rationale", &self.rationale)?;
+        properties.serialize_entry("gist", &self.gist)?;
+        properties.serialize_entry("priority", &self.priority)?;
+        properties.serialize_entry("novelty", &self.novelty)?;
+        properties.serialize_entry("durability", &self.durability)?;
+        properties.serialize_entry("confidence", &self.confidence)?;
+        properties.serialize_entry("retrieval_terms", &self.retrieval_terms)?;
+        properties.end()
+    }
+}
+
+fn extraction_schema(
+    source_ids: &[String],
+    proof_required: bool,
+) -> Result<String, WorkerFailure> {
+    serde_json::to_string(&OrderedExtractionSchema {
+        schema_type: "object",
+        additional_properties: false,
+        required: [
+            "source_ids",
+            "proof_source_ids",
+            "proposed_title",
+            "rationale",
+            "gist",
+            "priority",
+            "novelty",
+            "durability",
+            "confidence",
+            "retrieval_terms",
         ],
-        "properties": {
-            "source_ids": {
-                "type": "array", "minItems": 1, "maxItems": GIGA_MAX_SELECTED_SOURCES,
-                "uniqueItems": true, "items": { "type": "string", "enum": source_ids }
-            },
-            "proof_source_ids": {
-                "type": "array", "minItems": if proof_required { 1 } else { 0 },
-                "maxItems": GIGA_MAX_SELECTED_SOURCES, "uniqueItems": true,
+        properties: OrderedExtractionProperties {
+            source_ids: json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": GIGA_MAX_SELECTED_SOURCES,
+                "uniqueItems": true,
                 "items": { "type": "string", "enum": source_ids }
-            },
-            "proposed_title": { "type": "string", "minLength": 1, "maxLength": 160 },
-            "gist": { "type": "string", "minLength": 1, "maxLength": 1200 },
-            "rationale": { "type": "string", "minLength": 1, "maxLength": 1200 },
-            "priority": { "type": "number", "minimum": 0, "maximum": 1 },
-            "novelty": { "type": "number", "minimum": 0, "maximum": 1 },
-            "durability": { "type": "number", "minimum": 0, "maximum": 1 },
-            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-            "retrieval_terms": {
-                "type": "array", "maxItems": GIGA_MAX_RETRIEVAL_TERMS, "uniqueItems": true,
-                "items": { "type": "string", "minLength": 1, "maxLength": 80 }
-            }
-        }
+            }),
+            proof_source_ids: json!({
+                "type": "array",
+                "minItems": if proof_required { 1 } else { 0 },
+                "maxItems": GIGA_MAX_SELECTED_SOURCES,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": source_ids }
+            }),
+            proposed_title: json!({ "type": "string", "minLength": 1 }),
+            rationale: json!({ "type": "string", "minLength": 1 }),
+            gist: json!({ "type": "string", "minLength": 1 }),
+            priority: json!({ "type": "number", "minimum": 0, "maximum": 1 }),
+            novelty: json!({ "type": "number", "minimum": 0, "maximum": 1 }),
+            durability: json!({ "type": "number", "minimum": 0, "maximum": 1 }),
+            confidence: json!({ "type": "number", "minimum": 0, "maximum": 1 }),
+            retrieval_terms: json!({
+                "type": "array",
+                "maxItems": GIGA_MAX_RETRIEVAL_TERMS,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+            }),
+        },
     })
+    .map_err(|_| WorkerFailure::new("GigaClassifierRequestError", false))
 }
 
+fn schema_json(value: Value) -> Result<String, WorkerFailure> {
+    serde_json::to_string(&value)
+        .map_err(|_| WorkerFailure::new("GigaClassifierRequestError", false))
+}
+
+#[derive(Serialize)]
+struct OllamaOptions {
+    temperature: u8,
+    seed: u32,
+    num_ctx: u32,
+    num_predict: u32,
+}
+
+#[derive(Serialize)]
+struct OllamaRequest<'a> {
+    model: &'static str,
+    messages: [Value; 2],
+    stream: bool,
+    think: bool,
+    format: &'a RawValue,
+    keep_alive: &'static str,
+    options: OllamaOptions,
+}
 async fn request_ollama_structured<T: for<'de> Deserialize<'de>>(
     config: &OllamaConfig,
     system_prompt: &str,
     user_payload: Value,
-    schema: Value,
+    schema: String,
     num_predict: u32,
 ) -> Result<T, WorkerFailure> {
     let user_content = serde_json::to_string(&user_payload)
         .map_err(|_| WorkerFailure::new("GigaClassifierRequestError", false))?;
-    let request = json!({
-        "model": GIGA_MODEL_TAG,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_content }
+    let schema = RawValue::from_string(schema)
+        .map_err(|_| WorkerFailure::new("GigaClassifierRequestError", false))?;
+    let request = OllamaRequest {
+        model: GIGA_MODEL_TAG,
+        messages: [
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": user_content }),
         ],
-        "stream": false,
-        "think": false,
-        "format": schema,
-        "options": {
-            "temperature": 0,
-            "seed": 42,
-            "num_ctx": 4096,
-            "num_predict": num_predict
-        }
-    });
+        stream: false,
+        think: false,
+        format: schema.as_ref(),
+        keep_alive: GIGA_KEEP_ALIVE,
+        options: OllamaOptions {
+            temperature: 0,
+            seed: 42,
+            num_ctx: GIGA_NUM_CTX,
+            num_predict,
+        },
+    };
     let body = bounded_response(
         HTTP_CLIENT
             .post(ollama_url(config, "/api/chat")?)
@@ -456,6 +575,23 @@ fn bounded_trimmed(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && value.trim() == value
 }
 
+fn truncate_with_marker(value: &str, maximum: usize, marker: &str) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    if marker.len() >= maximum {
+        return marker.chars().take(maximum).collect();
+    }
+    let mut content_end = maximum - marker.len();
+    while !value.is_char_boundary(content_end) {
+        content_end -= 1;
+    }
+    let mut truncated = String::with_capacity(maximum);
+    truncated.push_str(&value[..content_end]);
+    truncated.push_str(marker);
+    truncated
+}
+
 fn validate_gate(gate: &GateOutput, event: &GigaEvent) -> Result<(), WorkerFailure> {
     let source_ids = event
         .source_refs()
@@ -473,7 +609,6 @@ fn validate_gate(gate: &GateOutput, event: &GigaEvent) -> Result<(), WorkerFailu
     }
     Ok(())
 }
-
 fn finite_score(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
@@ -491,7 +626,7 @@ fn validate_extraction(
         || (gate.kind.requires_proof() && extraction.proof_source_ids.is_empty())
         || !bounded_trimmed(&extraction.proposed_title, 160)
         || !bounded_trimmed(&extraction.gist, 1_200)
-        || !bounded_trimmed(&extraction.rationale, 1_200)
+        || !bounded_trimmed(&extraction.rationale, GIGA_MAX_MODEL_RATIONALE_BYTES)
         || !finite_score(extraction.priority)
         || !finite_score(extraction.novelty)
         || !finite_score(extraction.durability)
@@ -531,7 +666,7 @@ fn configuration_digest(config: &OllamaConfig) -> Result<String, WorkerFailure> 
         "extraction_prompt_digest": sha256_bytes(GIGA_EXTRACTION_PROMPT.as_bytes()),
         "temperature": 0,
         "seed": 42,
-        "num_ctx": 4096,
+        "num_ctx": GIGA_NUM_CTX,
         "gate_num_predict": 256,
         "extraction_num_predict": 768
     }))
@@ -626,7 +761,7 @@ async fn classify_event(
             "project_keys": event.project_keys(),
             "sources": model_sources
         }),
-        gate_schema(&all_source_ids),
+        schema_json(gate_schema(&all_source_ids))?,
         256,
     )
     .await?;
@@ -643,11 +778,16 @@ async fn classify_event(
             "project_keys": event.project_keys(),
             "sources": model_sources
         }),
-        extraction_schema(&gate.source_ids, gate.kind.requires_proof()),
+        extraction_schema(&gate.source_ids, gate.kind.requires_proof())?,
         768,
     )
     .await?;
     validate_extraction(&extraction, &gate)?;
+    let rationale = truncate_with_marker(
+        &extraction.rationale,
+        GIGA_MAX_STORED_RATIONALE_BYTES,
+        GIGA_RATIONALE_TRUNCATION_MARKER,
+    );
     let selected = sources
         .iter()
         .filter(|resolved| {
@@ -702,7 +842,7 @@ async fn classify_event(
         extraction.retrieval_terms,
         extraction.proposed_title,
         extraction.gist,
-        extraction.rationale,
+        rationale,
         scope,
         GigaAuthority::PointerOnly,
         GigaReviewState::Unreviewed,
@@ -1275,5 +1415,25 @@ mod tests {
             configuration_digest(&first).unwrap(),
             configuration_digest(&second).unwrap()
         );
+    }
+    #[test]
+    fn extraction_schema_keeps_rationale_before_gist() {
+        let schema = extraction_schema(&["turn-1".into()], true).unwrap();
+        let properties = schema.split("\"properties\":").nth(1).unwrap();
+        assert!(
+            properties.find("\"rationale\"").unwrap() < properties.find("\"gist\"").unwrap()
+        );
+    }
+
+    #[test]
+    fn classifier_rationale_is_bounded_with_an_explicit_marker() {
+        let source = "r".repeat(GIGA_MAX_STORED_RATIONALE_BYTES + 32);
+        let stored = truncate_with_marker(
+            &source,
+            GIGA_MAX_STORED_RATIONALE_BYTES,
+            GIGA_RATIONALE_TRUNCATION_MARKER,
+        );
+        assert!(stored.len() <= GIGA_MAX_STORED_RATIONALE_BYTES);
+        assert!(stored.ends_with(GIGA_RATIONALE_TRUNCATION_MARKER));
     }
 }

@@ -23,7 +23,7 @@ pub use giga::{
 };
 pub use giga_worker::giga_process;
 pub use recall::{RecallParams, RecallResult, recall};
-pub use remember::{RememberReceipt, RememberRequest, remember};
+pub use remember::{RememberReceipt, RememberRequest, ThreadContinuation, remember};
 
 #[cfg(test)]
 mod tests {
@@ -42,6 +42,7 @@ mod tests {
             source_path: None,
             source_memory_path: None,
             threads: vec![],
+            continues: vec![],
             supersedes: vec![],
             shape: None,
             voice: None,
@@ -65,6 +66,7 @@ mod tests {
             source_path: None,
             source_memory_path: None,
             threads: vec![],
+            continues: vec![],
             supersedes: vec![],
             shape: None,
             voice: None,
@@ -88,6 +90,7 @@ mod tests {
             source_path: None,
             source_memory_path: None,
             threads: vec![],
+            continues: vec![],
             supersedes: vec![],
             shape: None,
             voice: None,

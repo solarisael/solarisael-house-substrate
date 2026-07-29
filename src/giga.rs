@@ -737,7 +737,22 @@ pub async fn giga_health(
                 COUNT(*) FILTER (WHERE queue_state='failed')::bigint AS failed_count,
                 (SELECT latest.last_error FROM giga_events latest
                  WHERE latest.room=$1 AND latest.last_error IS NOT NULL
-                 ORDER BY latest.updated_at DESC,latest.event_id LIMIT 1) AS last_error
+                 ORDER BY latest.updated_at DESC,latest.event_id LIMIT 1) AS last_error,
+                (SELECT latest.updated_at FROM giga_events latest
+                 WHERE latest.room=$1 AND latest.last_error IS NOT NULL
+                 ORDER BY latest.updated_at DESC,latest.event_id LIMIT 1) AS last_error_at,
+                COALESCE((
+                    SELECT COUNT(*)::bigint
+                    FROM (
+                        SELECT outcome,
+                               SUM(CASE WHEN outcome='succeeded' THEN 1 ELSE 0 END)
+                                   OVER (ORDER BY finished_at DESC,event_id,replay_count,attempt_count
+                                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS successes
+                        FROM giga_event_attempts
+                        WHERE room=$1 AND finished_at IS NOT NULL
+                    ) recent
+                    WHERE recent.successes=0 AND recent.outcome <> 'succeeded'
+                ),0)::bigint AS consecutive_failures
          FROM giga_events WHERE room=$1",
     )
     .bind(&room)
@@ -762,6 +777,9 @@ pub async fn giga_health(
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
     let oldest: Option<i64> = event.try_get("oldest_age")?;
     let last_error: Option<String> = event.try_get("last_error")?;
+    let last_error_at: Option<DateTime<Utc>> = event.try_get("last_error_at")?;
+    let consecutive_failures: u64 =
+        event.try_get::<i64, _>("consecutive_failures")? as u64;
     Ok(GigaHealthResult {
         enabled: giga_classifier_enabled(),
         store_healthy: true,
@@ -770,7 +788,11 @@ pub async fn giga_health(
         processed_count: event.try_get::<i64, _>("processed_count")? as u64,
         failed_count: event.try_get::<i64, _>("failed_count")? as u64,
         candidates_by_kind_state,
-        classifier: giga_classifier_health(last_error),
+        classifier: giga_classifier_health(
+            last_error,
+            last_error_at.map(|value| value.to_rfc3339()),
+            consecutive_failures,
+        ),
     })
 }
 

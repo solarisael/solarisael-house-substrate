@@ -95,6 +95,54 @@ def parse_meta(kv_args, bool_args) -> dict:
     return meta
 
 
+def normalize_threads(values: list[str]) -> list[str]:
+    threads: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        thread = value.strip()
+        if not thread:
+            sys.exit("--thread values must be nonblank")
+        if thread not in seen:
+            seen.add(thread)
+            threads.append(thread)
+    return threads
+
+
+def parse_continues(values: list[str] | None, threads: list[str]) -> list[dict]:
+    continuations: list[dict] = []
+    seen: set[str] = set()
+    available = set(threads)
+    for raw in values or []:
+        try:
+            continuation = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"--continues must be valid JSON: {exc.msg}")
+        if not isinstance(continuation, dict):
+            sys.exit("--continues must be a JSON object")
+        thread_value = continuation.get("thread")
+        thread = thread_value.strip() if isinstance(thread_value, str) else ""
+        if not thread:
+            sys.exit("--continues thread must be nonblank")
+        previous_value = continuation.get("previousMemoryId")
+        if isinstance(previous_value, bool):
+            sys.exit("--continues previousMemoryId must be a positive decimal integer")
+        if isinstance(previous_value, int):
+            previous_id = previous_value
+        elif isinstance(previous_value, str) and re.fullmatch(r"[1-9]\d*", previous_value):
+            previous_id = int(previous_value)
+        else:
+            sys.exit("--continues previousMemoryId must be a positive decimal integer")
+        if previous_id <= 0 or previous_id > 9223372036854775807:
+            sys.exit("--continues previousMemoryId must fit a positive PostgreSQL BIGINT")
+        if thread in seen:
+            sys.exit(f"--continues must contain at most one entry per thread: {thread!r}")
+        if thread not in available:
+            sys.exit(f"--continues thread must also be present in --thread: {thread!r}")
+        seen.add(thread)
+        continuations.append({"thread": thread, "previousMemoryId": previous_id})
+    return continuations
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Direct write to solarisael_memory.memories.")
     p.add_argument("--room", required=True)
@@ -115,6 +163,8 @@ def main() -> None:
                    help="thread key (slash-separated concept-variants); repeatable")
     p.add_argument("--supersedes", type=int, action="append", default=[],
                    help="memory id this new write supersedes; repeatable")
+    p.add_argument("--continues", action="append",
+                   help='JSON continuation {"thread": "...", "previousMemoryId": 123}; repeatable')
     p.add_argument("--canon-touches", action="append", default=[],
                    help="named_entity name this memory touches; repeatable. "
                         "Adds the new source_path to that entity's pointer_files "
@@ -154,7 +204,8 @@ def main() -> None:
     except ValueError:
         sys.exit(f"--date {date_!r} is not a valid YYYY-MM-DD")
     dates_array = derive_dates(args.source_path, primary_date, args.also_date)
-    threads = args.thread or []
+    threads = normalize_threads(args.thread or [])
+    continues = parse_continues(args.continues, threads)
     meta = parse_meta(args.meta_kv, args.meta_bool)
 
     canon_touches = args.canon_touches or []
@@ -166,6 +217,7 @@ def main() -> None:
             "title": args.title, "source_path": args.source_path,
             "body_chars": len(body), "threads": threads,
             "supersedes": args.supersedes,
+            "continues": continues,
             "canon_touches": canon_touches,
             "embed_inline": args.embed,
             "meta": meta,
@@ -232,17 +284,100 @@ def main() -> None:
                 )
                 superseded_ids = [item[0] for item in cur.fetchall()]
 
-            # Rebuild pivot rows. Direct writes have no markdown twin so no
-            # line ranges; thread_keys land with NULL lines + empty context.
-            cur.execute("DELETE FROM memory_threads WHERE memory_id = %s", (memory_id,))
-            if threads:
-                cur.executemany(
+            # Synchronize the thread registry, events, and direct-write refs.
+            events: dict[str, int] = {}
+            for thread in threads:
+                cur.execute(
                     """
-                    INSERT INTO memory_threads (memory_id, thread_key, lines_start, lines_end, context)
-                    VALUES (%s, %s, NULL, NULL, '')
+                    INSERT INTO threads (room, thread_key)
+                    VALUES (%s, %s)
+                    ON CONFLICT (room, thread_key) DO UPDATE
+                    SET thread_key = EXCLUDED.thread_key
+                    RETURNING id
                     """,
-                    [(memory_id, t) for t in threads],
+                    (args.room, thread),
                 )
+                thread_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO thread_events (thread_id, memory_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (thread_id, memory_id) DO UPDATE
+                    SET memory_id = EXCLUDED.memory_id
+                    RETURNING id
+                    """,
+                    (thread_id, memory_id),
+                )
+                event_id = cur.fetchone()[0]
+                events[thread] = event_id
+                cur.execute("DELETE FROM memory_thread_refs WHERE event_id = %s", (event_id,))
+                cur.execute(
+                    """
+                    INSERT INTO memory_thread_refs
+                        (event_id, lines_start, lines_end, context)
+                    VALUES (%s, NULL, NULL, '')
+                    """,
+                    (event_id,),
+                )
+            current_event_ids = list(events.values())
+            if current_event_ids:
+                cur.execute(
+                    "DELETE FROM thread_events "
+                    "WHERE memory_id = %s AND NOT (id = ANY(%s))",
+                    (memory_id, current_event_ids),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM thread_events WHERE memory_id = %s",
+                    (memory_id,),
+                )
+
+
+            # Replace only explicitly supplied incoming edges. An omitted
+            # continuation preserves that thread's existing link on upsert.
+            continued_ids = []
+            for continuation in continues:
+                thread = continuation["thread"]
+                previous_memory_id = continuation["previousMemoryId"]
+                cur.execute(
+                    """
+                    SELECT previous_event.id, current_thread.id
+                    FROM threads AS current_thread
+                    JOIN thread_events AS previous_event
+                      ON previous_event.thread_id = current_thread.id
+                    JOIN memories AS previous_memory
+                      ON previous_memory.id = previous_event.memory_id
+                    WHERE current_thread.room = %s
+                      AND current_thread.thread_key = %s
+                      AND previous_memory.room = %s
+                      AND previous_memory.id = %s
+                    """,
+                    (args.room, thread, args.room, previous_memory_id),
+                )
+                previous = cur.fetchone()
+                if previous is None:
+                    raise ValueError(
+                        f"continuation predecessor {previous_memory_id} must belong "
+                        f"to room {args.room!r} and thread {thread!r}"
+                    )
+                previous_event_id, thread_id = previous
+                next_event_id = events[thread]
+                if previous_event_id == next_event_id:
+                    raise ValueError("a memory cannot continue itself")
+                cur.execute(
+                    "DELETE FROM thread_event_links WHERE thread_id = %s AND next_event_id = %s",
+                    (thread_id, next_event_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO thread_event_links
+                        (thread_id, previous_event_id, next_event_id)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (thread_id, previous_event_id, next_event_id),
+                )
+                continued_ids.append((thread, previous_memory_id))
+
 
             # Inline chunk + embed (single-writer migration, 2026-05-19).
             # On UPSERT we rebuild chunks from scratch — cleaner than diff
@@ -329,6 +464,8 @@ def main() -> None:
         summary += f"  canon_touched={canon_added}/{canon_touches}"
     if args.supersedes:
         summary += f"  superseded={superseded_ids}/{sorted(set(args.supersedes))}"
+    if continues:
+        summary += f"  continues={continued_ids}"
     print(summary)
     # If we auto-woke Ollama just for this write, put it back to sleep so we
     # leave the host as we found it.

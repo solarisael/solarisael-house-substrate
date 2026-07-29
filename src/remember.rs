@@ -8,8 +8,18 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    time::Duration,
+};
 use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct ThreadContinuation {
+    pub thread: String,
+    #[serde(alias = "previousMemoryId")]
+    pub previous_memory_id: i64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
@@ -26,6 +36,8 @@ pub struct RememberRequest {
     pub source_memory_path: Option<String>,
     #[serde(default)]
     pub threads: Vec<String>,
+    #[serde(default)]
+    pub continues: Vec<ThreadContinuation>,
     #[serde(default)]
     pub supersedes: Vec<i64>,
     #[serde(default)]
@@ -131,11 +143,34 @@ impl RememberRequest {
                     "supersedes must contain positive IDs".into(),
                 ));
             }
+            let threads = normalize_threads(&self.threads);
+            let mut predecessors = HashSet::new();
+            for continuation in &self.continues {
+                let thread = continuation.thread.trim();
+                if thread.is_empty() || continuation.previous_memory_id <= 0 {
+                    return Err(AppError::Invalid(
+                        "continues entries require a thread and positive previousMemoryId".into(),
+                    ));
+                }
+                if !threads.iter().any(|candidate| candidate == thread) {
+                    return Err(AppError::Invalid(
+                        "continues thread must also be present in threads".into(),
+                    ));
+                }
+                if !predecessors.insert(thread) {
+                    return Err(AppError::Invalid(
+                        "continues may name only one predecessor per thread".into(),
+                    ));
+                }
+            }
         } else if lessons.contains(&self.kind.as_str()) {
-            if !self.threads.is_empty() || !self.supersedes.is_empty() || self.source_path.is_some()
+            if !self.threads.is_empty()
+                || !self.continues.is_empty()
+                || !self.supersedes.is_empty()
+                || self.source_path.is_some()
             {
                 return Err(AppError::Invalid(
-                    "threads/supersedes/source_path are memory-only".into(),
+                    "threads/continues/supersedes/source_path are memory-only".into(),
                 ));
             }
             if self
@@ -221,6 +256,13 @@ pub async fn remember(
         &req.supersedes,
         meta,
         &prepared,
+    )
+    .await?;
+    write_continuations_tx(
+        &mut tx,
+        &req.room,
+        memory_id,
+        &req.continues,
     )
     .await?;
     tx.commit().await?;
@@ -322,17 +364,45 @@ pub(crate) async fn write_memory_tx(
     .bind(meta)
     .fetch_one(&mut **tx)
     .await?;
-    sqlx::query("DELETE FROM memory_threads WHERE memory_id=$1")
+    for thread_key in &prepared.threads {
+        let thread_id: i64 = sqlx::query_scalar(
+            "INSERT INTO threads (room,thread_key) VALUES ($1,$2)
+             ON CONFLICT (room,thread_key) DO UPDATE SET thread_key=EXCLUDED.thread_key
+             RETURNING id",
+        )
+        .bind(room)
+        .bind(thread_key)
+        .fetch_one(&mut **tx)
+        .await?;
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO thread_events (thread_id,memory_id) VALUES ($1,$2)
+             ON CONFLICT (thread_id,memory_id) DO UPDATE SET memory_id=EXCLUDED.memory_id
+             RETURNING id",
+        )
+        .bind(thread_id)
         .bind(memory_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO memory_thread_refs (event_id)
+             SELECT $1 WHERE NOT EXISTS (
+                 SELECT 1 FROM memory_thread_refs WHERE event_id=$1
+             )",
+        )
+        .bind(event_id)
         .execute(&mut **tx)
         .await?;
-    for thread in &prepared.threads {
-        sqlx::query("INSERT INTO memory_threads (memory_id,thread_key) VALUES ($1,$2)")
-            .bind(memory_id)
-            .bind(thread)
-            .execute(&mut **tx)
-            .await?;
     }
+    sqlx::query(
+        "DELETE FROM thread_events e USING threads t
+         WHERE e.thread_id=t.id AND e.memory_id=$1 AND t.room=$2
+           AND NOT (t.thread_key = ANY($3::text[]))",
+    )
+    .bind(memory_id)
+    .bind(room)
+    .bind(&prepared.threads)
+    .execute(&mut **tx)
+    .await?;
     for old_id in supersedes.iter().copied().collect::<BTreeSet<_>>() {
         sqlx::query("UPDATE memories SET superseded_by=$1 WHERE id=$2 AND id<>$1")
             .bind(memory_id)
@@ -385,6 +455,66 @@ pub(crate) async fn write_memory_tx(
         .await?;
     }
     Ok(memory_id)
+}
+
+async fn write_continuations_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: &str,
+    memory_id: i64,
+    continuations: &[ThreadContinuation],
+) -> Result<(), AppError> {
+    let mut seen = HashSet::new();
+    for continuation in continuations {
+        let thread_key = continuation.thread.trim();
+        if !seen.insert(thread_key) {
+            continue;
+        }
+        if continuation.previous_memory_id == memory_id {
+            return Err(AppError::Invalid(
+                "a memory cannot continue itself".into(),
+            ));
+        }
+        let events = sqlx::query(
+            "SELECT current_event.thread_id,
+                    current_event.id AS next_event_id,
+                    previous_event.id AS previous_event_id
+             FROM threads t
+             JOIN thread_events current_event
+               ON current_event.thread_id=t.id AND current_event.memory_id=$3
+             JOIN thread_events previous_event
+               ON previous_event.thread_id=t.id AND previous_event.memory_id=$4
+             JOIN memories previous_memory ON previous_memory.id=previous_event.memory_id
+             WHERE t.room=$1 AND t.thread_key=$2 AND previous_memory.room=$1
+             FOR KEY SHARE OF t,current_event,previous_event,previous_memory",
+        )
+        .bind(room)
+        .bind(thread_key)
+        .bind(memory_id)
+        .bind(continuation.previous_memory_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(events) = events else {
+            return Err(AppError::Invalid(format!(
+                "previous memory {} must share room {room} and thread {thread_key}",
+                continuation.previous_memory_id
+            )));
+        };
+        let thread_id: i64 = sqlx::Row::try_get(&events, "thread_id")?;
+        let next_event_id: i64 = sqlx::Row::try_get(&events, "next_event_id")?;
+        let previous_event_id: i64 = sqlx::Row::try_get(&events, "previous_event_id")?;
+        sqlx::query(
+            "INSERT INTO thread_event_links (thread_id,previous_event_id,next_event_id)
+             VALUES ($1,$2,$3)
+             ON CONFLICT (thread_id,next_event_id) DO UPDATE
+             SET previous_event_id=EXCLUDED.previous_event_id",
+        )
+        .bind(thread_id)
+        .bind(previous_event_id)
+        .bind(next_event_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,7 +617,7 @@ async fn remember_lesson(
     let id = match req.kind.as_str() {
         "coding-lesson" => write_coding_lesson_tx(
             &mut tx,
-            req.scope.as_deref().unwrap_or("shared"),
+            req.scope.as_deref().unwrap_or("house"),
             req.project.as_deref(),
             req.voice.as_deref(),
             req.shape.as_deref(),
@@ -539,13 +669,12 @@ async fn remember_lesson(
 }
 
 pub(crate) fn normalize_threads(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
     values
         .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && seen.insert(*value))
         .map(str::to_string)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect()
 }
 

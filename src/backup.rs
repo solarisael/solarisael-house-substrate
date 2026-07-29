@@ -17,7 +17,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2", "3", "4", "5"];
+const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2", "3", "4", "5", "6"];
 const LEGACY_MIGRATIONS: &[&str] = &[
     "0001_create_memories",
     "0002_memory_threads_pivot",

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -28,7 +30,10 @@ REQUIRED_SCRIPTS = (
 )
 REQUIRED_TABLES = (
     "memories",
-    "memory_threads",
+    "threads",
+    "thread_events",
+    "memory_thread_refs",
+    "thread_event_links",
     "memory_chunks",
     "named_entities",
     "coding_lessons",
@@ -51,8 +56,22 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
+def connect():
+    return psycopg2.connect(
+        host=os.environ.get("PGHOST", "127.0.0.1"),
+        port=os.environ.get("PGPORT", "5432"),
+        user=os.environ["PGUSER"],
+        password=os.environ["PGPASSWORD"],
+        dbname=os.environ["PGDATABASE"],
+        connect_timeout=3,
+    )
+
+
 def probe_embedding(timeout: float) -> dict:
-    url = os.environ.get("SOLARISAEL_EMBED_URL", "http://127.0.0.1:11435/api/embed")
+    # Canon is the Windows-native GPU Ollama on 11434. The old 11435 fossil is a
+    # WSL CPU service that often still answers, so guessing it makes this probe
+    # report green against a server nothing else uses. Measured 2026-07-26.
+    url = os.environ.get("SOLARISAEL_EMBED_URL", "http://127.0.0.1:11434/api/embed")
     model = os.environ.get("SOLARISAEL_EMBED_MODEL", "hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest")
     raw_expected = os.environ.get("SOLARISAEL_EMBED_DIMENSION", "2048")
     try:
@@ -88,14 +107,7 @@ def probe_database() -> dict:
     if psycopg2 is None:
         return {"ok": False, "error": f"psycopg2 unavailable: {PSYCOPG_ERROR}"}
     try:
-        conn = psycopg2.connect(
-            host=os.environ.get("PGHOST", "127.0.0.1"),
-            port=os.environ.get("PGPORT", "5432"),
-            user=os.environ["PGUSER"],
-            password=os.environ["PGPASSWORD"],
-            dbname=os.environ["PGDATABASE"],
-            connect_timeout=3,
-        )
+        conn = connect()
         with conn, conn.cursor() as cur:
             cur.execute("SELECT current_database(), current_user")
             database, user = cur.fetchone()
@@ -107,7 +119,7 @@ def probe_database() -> dict:
             schema_version = cur.fetchone()[0]
         conn.close()
         missing = sorted(set(REQUIRED_TABLES) - tables)
-        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 1
+        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 6
         return {
             "ok": ok,
             "database": database,
@@ -121,11 +133,181 @@ def probe_database() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def newest_dump(directory: Path) -> Path | None:
+    dumps = sorted(directory.glob("*.dump"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return dumps[0] if dumps else None
+
+
+def resolve_backup_directory(root: Path) -> Path:
+    """Find the backups directory the writers actually fill.
+
+    Two substrate trees exist and have drifted; each backup.sh dumps beside
+    itself, and one of the two sits empty. Preferring whichever holds a real
+    dump keeps the verdict from reading green off the empty sibling. The
+    resolved path is always reported so the divergence stays visible.
+    """
+    override = os.environ.get("SOLARISAEL_BACKUP_DIR")
+    if override:
+        return Path(override)
+    candidates = (root / "backups", root.parent / "substrate" / "backups")
+    for candidate in candidates:
+        if candidate.is_dir() and newest_dump(candidate):
+            return candidate
+    return candidates[0]
+
+
+def probe_backup(max_age_hours: float, root: Path) -> dict:
+    """The safety net has no nerve of its own.
+
+    backup_runner.py warns and returns on every failure so a dead dump can
+    never abort a memory write. That is the right call, and it is why backups
+    once stayed dead five hours while health read green. This is the alarm.
+    """
+    directory = resolve_backup_directory(root)
+    if not directory.is_dir():
+        return {"ok": False, "directory": str(directory), "error": "backup directory does not exist"}
+    dump = newest_dump(directory)
+    if dump is None:
+        return {"ok": False, "directory": str(directory), "error": "no dump files present"}
+    stat = dump.stat()
+    age_hours = (time.time() - stat.st_mtime) / 3600
+    with dump.open("rb") as handle:
+        header = handle.read(5)
+    problems = []
+    if header != b"PGDMP":
+        problems.append("newest dump is not a pg_dump custom-format archive")
+    if age_hours > max_age_hours:
+        problems.append(f"newest dump is {age_hours:.1f}h old, past the {max_age_hours:.0f}h bound")
+    return {
+        "ok": not problems,
+        "directory": str(directory),
+        "newest": dump.name,
+        "ageHours": round(age_hours, 2),
+        "bytes": stat.st_size,
+        **({"error": "; ".join(problems)} if problems else {}),
+    }
+
+
+def resolve_substrate_binary(root: Path) -> Path:
+    override = os.environ.get("SOLARISAEL_HOUSE_RUST")
+    if override:
+        return Path(override)
+    # The substrate binary is a Windows .exe even when this probe is invoked
+    # from WSL, which runs it happily. Keying the suffix off os.name made the
+    # retrieval organ report dead from one side of the loopback and alive from
+    # the other. Look for what exists instead of guessing from the host.
+    release = root / "target" / "release"
+    for name in ("solarisael-house-substrate.exe", "solarisael-house-substrate"):
+        if (release / name).is_file():
+            return release / name
+    return release / "solarisael-house-substrate"
+
+
+def phrase_from_corpus() -> tuple[str, str] | None:
+    """Lift a probe query verbatim out of the newest embedded chunk.
+
+    A phrase taken from the corpus must match itself. That is what makes this
+    probe rot-proof: no golden string to go stale as memories change, and a
+    failure means the lane is broken rather than the query gone cold.
+    """
+    try:
+        conn = connect()
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT m.room, mc.body
+                FROM memory_chunks mc
+                JOIN memories m ON m.id = mc.memory_id
+                WHERE mc.body_embedding IS NOT NULL AND length(mc.body) > 200
+                ORDER BY mc.embedded_at DESC NULLS LAST, mc.id DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    room, body = row
+    words = [word for word in body.split() if not set(word) <= set("#*-_`")]
+    return (room, " ".join(words[:16])) if len(words) >= 8 else None
+
+
+def probe_retrieval(timeout: float, root: Path) -> dict:
+    """Drive the real binary, because a SQL imitation reads green while it is dark.
+
+    The lane went dark for a full night behind a working database and a working
+    embedder: the reason string below is emitted only for semantic
+    contributions, and it was absent from every sample. Assert on that string.
+    """
+    binary = resolve_substrate_binary(root)
+    if not binary.is_file():
+        return {"ok": False, "binary": str(binary), "error": "substrate binary not found"}
+    probe = phrase_from_corpus()
+    if probe is None:
+        return {"ok": False, "error": "no embedded chunk available to build a probe query"}
+    room, query = probe
+    envelope = json.dumps(
+        {"protocol": 1, "id": "health", "method": "recall", "params": {"room": room, "query": query}}
+    )
+    try:
+        completed = subprocess.run(
+            [str(binary)],
+            input=envelope + "\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(root),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "binary": str(binary), "query": query, "error": str(exc)}
+    line = next((raw for raw in reversed(completed.stdout.splitlines()) if raw.strip()), "")
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        return {"ok": False, "query": query, "error": f"unparseable recall response: {detail[:200]}"}
+    result = payload.get("result") or {}
+    warnings = result.get("warnings") or []
+    candidates = result.get("retrievalCandidates") or []
+    semantic = [c for c in candidates if "semantic cosine similarity" in (c.get("reasons") or [])]
+    problems = []
+    if payload.get("error"):
+        problems.append(str(payload["error"])[:200])
+    if warnings:
+        problems.append("; ".join(str(w) for w in warnings)[:200])
+    if not semantic:
+        problems.append("no candidate carried a semantic cosine similarity reason")
+    return {
+        "ok": not problems,
+        "room": room,
+        "query": query,
+        "candidates": len(candidates),
+        "semanticCandidates": len(semantic),
+        **({"error": "; ".join(problems)} if problems else {}),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-file", default=str(Path(__file__).with_name(".env")))
     parser.add_argument("--skip-embedding", action="store_true")
+    # Off by default, and deliberately so. This verdict feeds substrateHealth(),
+    # which the adapter calls on a 3s lane-status budget and an 8s diagnostic
+    # budget to decide whether memory is usable at all. The retrieval probe
+    # spawns the substrate binary and embeds a query; a cold model alone has
+    # measured ~10s. In a system whose doctrine is that retrieval must never
+    # block a conversation, the liveness ping must never be the reason memory
+    # looks dead. Deep organ checks belong to the release checklist, not the
+    # hot path — see docs/RELEASE.md.
+    parser.add_argument("--retrieval", action="store_true",
+                        help="exercise the real recall lane; slow, for release checks")
     parser.add_argument("--timeout", type=float, default=8.0)
+    # A cold Nemotron load measured ~10s, and the content lane can take 5s on
+    # top of it. The embed probe's 8s budget is far too tight for the real door.
+    parser.add_argument("--retrieval-timeout", type=float, default=45.0)
+    parser.add_argument("--max-backup-age-hours", type=float, default=24.0)
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     load_dotenv(Path(args.env_file))
@@ -134,6 +316,12 @@ def main() -> int:
     scripts = {"ok": not missing_scripts, "missing": missing_scripts}
     database = probe_database()
     embedding = {"ok": None, "skipped": True} if args.skip_embedding else probe_embedding(args.timeout)
+    retrieval = (
+        probe_retrieval(args.retrieval_timeout, root)
+        if args.retrieval
+        else {"ok": None, "skipped": True, "reason": "not requested; pass --retrieval"}
+    )
+    backup = probe_backup(args.max_backup_age_hours, root)
     reasons = []
     if not scripts["ok"]:
         reasons.append("required substrate scripts are missing")
@@ -141,8 +329,22 @@ def main() -> int:
         reasons.append("PostgreSQL substrate is unavailable or incomplete")
     if embedding.get("ok") is False:
         reasons.append("embedding service is unavailable or incompatible")
+    if retrieval.get("ok") is False:
+        reasons.append("retrieval lane returned no semantic match")
+    if backup.get("ok") is False:
+        reasons.append("backup safety net is stale or missing")
     mode = "full" if not reasons else "degraded"
-    result = {"ok": not reasons, "mode": mode, "substrateApi": 1, "scripts": scripts, "database": database, "embedding": embedding, "degradedReasons": reasons}
+    result = {
+        "ok": not reasons,
+        "mode": mode,
+        "substrateApi": 1,
+        "scripts": scripts,
+        "database": database,
+        "embedding": embedding,
+        "retrieval": retrieval,
+        "backup": backup,
+        "degradedReasons": reasons,
+    }
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["ok"] else 1
 

@@ -20,9 +20,10 @@ use solarisael_house_substrate::backup::{
 };
 use solarisael_house_substrate::{
     AnamnesisParams, AnamnesisSeed, AnamnesisWrite, AppError, Config, RecallParams,
-    RememberRequest, anamnesis, anamnesis_write, cluster_maintenance, giga_candidate_list,
-    giga_event_claim, giga_event_finish, giga_event_ingest, giga_event_replay, giga_health,
-    giga_process, giga_promote, giga_review, recall, remember,
+    RememberRequest, ThreadContinuation as ServiceThreadContinuation, anamnesis,
+    anamnesis_write, cluster_maintenance, giga_candidate_list, giga_event_claim,
+    giga_event_finish, giga_event_ingest, giga_event_replay, giga_health, giga_process,
+    giga_promote, giga_review, recall, remember,
 };
 use std::{
     env,
@@ -80,6 +81,19 @@ fn remember_service_request(
         .iter()
         .map(|&id| positive_i64(id, "supersedes ID"))
         .collect::<Result<Vec<_>, _>>()?;
+    let continues = request
+        .continues()
+        .iter()
+        .map(|continuation| {
+            Ok(ServiceThreadContinuation {
+                thread: continuation.thread.clone(),
+                previous_memory_id: positive_i64(
+                    continuation.previous_memory_id,
+                    "previousMemoryId",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
     Ok(RememberRequest {
         room: request.room().to_string(),
         kind: request.kind().as_str().into(),
@@ -89,6 +103,7 @@ fn remember_service_request(
         source_path: request.source_path().map(str::to_owned),
         source_memory_path: None,
         threads: request.threads().to_vec(),
+        continues,
         supersedes,
         shape: request.shape().map(str::to_owned),
         voice: request.voice().map(str::to_owned),
