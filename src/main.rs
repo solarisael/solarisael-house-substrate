@@ -550,7 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ProtocolRequest::GigaProcess(request) => {
-                                match giga_process(pool, request).await {
+                                match giga_process(pool, config, request).await {
                                     Ok(result) => success_json(id, result)?,
                                     Err(error) => app_error(id, operation, error),
                                 }

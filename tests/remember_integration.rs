@@ -104,6 +104,8 @@ async fn isolated_database_guard() {
         embed_dimension: 2048,
         embed_required: false,
         test_embedding_disabled: true,
+        giga_source_ledger_dir: None,
+        giga_source_room: None,
     };
     let source_path = format!("isolated-test/{}", Uuid::new_v4());
     let body = "This mutation proves the dedicated PostgreSQL authority path.";
@@ -201,6 +203,8 @@ async fn ordered_thread_write_surfaces_explicit_recall_neighbors() {
         embed_dimension: 2048,
         embed_required: false,
         test_embedding_disabled: true,
+        giga_source_ledger_dir: None,
+        giga_source_room: None,
     };
     let suffix = Uuid::new_v4();
     let root_source = format!("thread-integration/{suffix}/root");
@@ -385,6 +389,8 @@ async fn lexical_recall_applies_durability_decay_only_when_requested() {
                     embed_dimension: 2_048,
                     embed_required: false,
                     test_embedding_disabled: true,
+                    giga_source_ledger_dir: None,
+                    giga_source_room: None,
                 };
                 let params = RecallParams {
                     room: room.into(),

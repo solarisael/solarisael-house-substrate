@@ -17,7 +17,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2", "3", "4", "5", "6"];
+const CONSOLIDATED_MIGRATIONS: &[&str] = &["1", "2", "3", "4", "5", "6", "7"];
 const LEGACY_MIGRATIONS: &[&str] = &[
     "0001_create_memories",
     "0002_memory_threads_pivot",
@@ -48,15 +48,16 @@ const LEGACY_MIGRATIONS: &[&str] = &[
 ];
 
 fn known_migration_lineage(versions: &[String]) -> bool {
-    [CONSOLIDATED_MIGRATIONS, LEGACY_MIGRATIONS]
-        .iter()
-        .any(|lineage| {
-            versions.len() == lineage.len()
-                && versions
-                    .iter()
-                    .zip(lineage.iter())
-                    .all(|(actual, expected)| actual == expected)
-        })
+    !versions.is_empty()
+        && [CONSOLIDATED_MIGRATIONS, LEGACY_MIGRATIONS]
+            .iter()
+            .any(|lineage| {
+                versions.len() <= lineage.len()
+                    && versions
+                        .iter()
+                        .zip(lineage.iter())
+                        .all(|(actual, expected)| actual == expected)
+            })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -505,19 +506,21 @@ mod tests {
         assert!(db_parts("postgres://host/db?dbname=other").is_err());
     }
     #[test]
-    fn accepts_consolidated_and_legacy_migration_lineages_only() {
+    fn accepts_known_migration_lineage_prefixes_only() {
         let strings = |lineage: &[&str]| {
             lineage
                 .iter()
-                .map(|version| version.to_string())
+                .map(|version| (*version).to_owned())
                 .collect::<Vec<_>>()
         };
         assert!(known_migration_lineage(&strings(CONSOLIDATED_MIGRATIONS)));
         assert!(known_migration_lineage(&strings(LEGACY_MIGRATIONS)));
-        let mut incomplete = strings(LEGACY_MIGRATIONS);
-        incomplete.pop();
-        assert!(!known_migration_lineage(&incomplete));
+        let mut previous_consolidated = strings(CONSOLIDATED_MIGRATIONS);
+        previous_consolidated.pop();
+        assert!(known_migration_lineage(&previous_consolidated));
+        assert!(!known_migration_lineage(&[]));
         assert!(!known_migration_lineage(&["0001".into(), "0002".into()]));
+        assert!(!known_migration_lineage(&["1".into(), "3".into()]));
     }
 
     #[test]

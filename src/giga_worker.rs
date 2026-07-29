@@ -1,23 +1,24 @@
 use crate::{
-    AppError,
+    AppError, Config,
     config::HTTP_CLIENT,
     giga::{database_now, event_from_store, giga_candidate_store_and_finish, giga_event_finish},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use house_core::{
-    GIGA_MAX_EVENT_ATTEMPTS, GigaAuthority, GigaCandidate, GigaCandidateKind,
+    GIGA_MAX_EVENT_ATTEMPTS, GIGA_MAX_PROCESS_SOURCE_BYTES, GIGA_MAX_PROCESS_SOURCES,
+    GIGA_MAX_PROCESS_WINDOW_BYTES, GigaAuthority, GigaCandidate, GigaCandidateKind,
     GigaClassifierIdentity, GigaEvent, GigaEventFinishOutcome, GigaEventFinishRequest,
     GigaEventType, GigaProcessRequest, GigaReviewState, GigaScope, GigaScores, GigaSourceRef,
     GigaSourceType, GigaVisibility,
 };
 use house_protocol::{GigaClassifierHealthResult, GigaProcessResult, RequiredNullable};
 use reqwest::{RequestBuilder, Url};
-use serde::{ser::SerializeMap, Deserialize, Serialize};
-use serde_json::{value::RawValue, Value, json};
+use serde::{Deserialize, Serialize, ser::SerializeMap};
+use serde_json::{Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use std::{env, sync::LazyLock, time::Duration};
-use tokio::time::sleep;
+use std::{collections::HashMap, env, sync::LazyLock, time::Duration};
+use tokio::{fs, time::sleep};
 use uuid::Uuid;
 
 pub const GIGA_PROMPT_VERSION: &str = "agents-a1-two-pass-v1";
@@ -114,10 +115,20 @@ struct OllamaConfig {
     endpoint: Url,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ResolvedSource {
     source: GigaSourceRef,
     text: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct LedgerSourceRecord {
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+    #[serde(rename = "messageID")]
+    message_id: Option<Value>,
+    role: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -423,10 +434,7 @@ impl Serialize for OrderedExtractionProperties {
     }
 }
 
-fn extraction_schema(
-    source_ids: &[String],
-    proof_required: bool,
-) -> Result<String, WorkerFailure> {
+fn extraction_schema(source_ids: &[String], proof_required: bool) -> Result<String, WorkerFailure> {
     serde_json::to_string(&OrderedExtractionSchema {
         schema_type: "object",
         additional_properties: false,
@@ -688,14 +696,12 @@ fn candidate_id(
     ]))
 }
 
-fn validate_source_bundle(
-    event: &GigaEvent,
-    request: &GigaProcessRequest,
-) -> Result<Vec<ResolvedSource>, WorkerFailure> {
+fn verify_event_sources(event: &GigaEvent, trusted_room: &str) -> Result<(), WorkerFailure> {
     if event.event_type() != GigaEventType::ConversationWindow
-        || event.event_id() != request.event_id()
+        || event.room().as_str() != trusted_room
         || event.project_keys().len() > 1
-        || event.source_refs().len() != request.sources().len()
+        || event.source_refs().is_empty()
+        || event.source_refs().len() > GIGA_MAX_PROCESS_SOURCES
     {
         return Err(WorkerFailure::new("GigaSourceVerificationError", false));
     }
@@ -715,21 +721,125 @@ fn validate_source_bundle(
             return Err(WorkerFailure::new("GigaSourceVerificationError", false));
         }
     }
-    request
-        .sources()
+    Ok(())
+}
+
+fn is_conversation_ledger(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && &bytes[10..] == b".jsonl"
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn ledger_source_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+async fn resolve_sources_from_ledger(
+    config: &Config,
+    event: &GigaEvent,
+) -> Result<Vec<ResolvedSource>, WorkerFailure> {
+    let trusted_room = config
+        .giga_source_room
+        .as_deref()
+        .ok_or_else(|| WorkerFailure::new("GigaLedgerUnavailableError", true))?;
+    verify_event_sources(event, trusted_room)?;
+    let directory = config
+        .giga_source_ledger_dir
+        .as_deref()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| WorkerFailure::new("GigaLedgerUnavailableError", true))?;
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|_| WorkerFailure::new("GigaLedgerUnavailableError", true))?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| WorkerFailure::new("GigaLedgerUnavailableError", true))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|_| WorkerFailure::new("GigaLedgerUnavailableError", true))?;
+        let name = entry.file_name();
+        if file_type.is_file() && name.to_str().is_some_and(is_conversation_ledger) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+
+    let wanted = event
+        .source_refs()
         .iter()
-        .map(|provided| {
-            let source = event
-                .source_refs()
-                .iter()
-                .find(|source| source.source_id() == provided.source_id())
-                .ok_or_else(|| WorkerFailure::new("GigaSourceVerificationError", false))?;
-            if sha256_bytes(provided.text().as_bytes()) != source.content_hash() {
+        .enumerate()
+        .map(|(index, source)| (source.source_id().to_owned(), index))
+        .collect::<HashMap<_, _>>();
+    let mut matches = vec![Vec::<LedgerSourceRecord>::new(); event.source_refs().len()];
+    for path in paths {
+        let contents = fs::read_to_string(path)
+            .await
+            .map_err(|_| WorkerFailure::new("GigaLedgerUnavailableError", true))?;
+        for line in contents.lines().filter(|line| !line.is_empty()) {
+            let Ok(record) = serde_json::from_str::<LedgerSourceRecord>(line) else {
+                continue;
+            };
+            let Some(source_id) = record.message_id.as_ref().and_then(ledger_source_id) else {
+                continue;
+            };
+            let Some(&index) = wanted.get(&source_id) else {
+                continue;
+            };
+            if record.session_id.as_deref() == Some(event.session_id()) {
+                matches[index].push(record);
+            }
+        }
+    }
+
+    let mut total_bytes = 0usize;
+    event
+        .source_refs()
+        .iter()
+        .zip(matches)
+        .map(|(source, mut records)| {
+            if records.is_empty() {
+                return Err(WorkerFailure::new("GigaSourceMissingError", false));
+            }
+            if records.len() != 1 {
+                return Err(WorkerFailure::new("GigaSourceAmbiguousError", false));
+            }
+            let record = records.pop().expect("one ledger record was checked");
+            if record.role.as_deref() != Some(source.role()) {
                 return Err(WorkerFailure::new("GigaSourceVerificationError", false));
+            }
+            let text = record
+                .text
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| WorkerFailure::new("GigaSourceVerificationError", false))?;
+            if sha256_bytes(text.as_bytes()) != source.content_hash() {
+                return Err(WorkerFailure::new("GigaSourceHashMismatchError", false));
+            }
+            total_bytes = total_bytes
+                .checked_add(text.len())
+                .ok_or_else(|| WorkerFailure::new("GigaSourceWindowTooLargeError", false))?;
+            if text.len() > GIGA_MAX_PROCESS_SOURCE_BYTES
+                || total_bytes > GIGA_MAX_PROCESS_WINDOW_BYTES
+            {
+                return Err(WorkerFailure::new("GigaSourceWindowTooLargeError", false));
             }
             Ok(ResolvedSource {
                 source: source.clone(),
-                text: provided.text().to_owned(),
+                text,
             })
         })
         .collect()
@@ -1112,14 +1222,17 @@ async fn wait_until(target: DateTime<Utc>) {
 
 pub async fn giga_process(
     pool: &PgPool,
+    config: &Config,
     request: GigaProcessRequest,
 ) -> Result<GigaProcessResult, AppError> {
     loop {
         let (event, attempt_count) = match claim_exact(pool, request.event_id()).await? {
             ClaimState::Terminal { event, result } => {
-                validate_source_bundle(&event, &request).map_err(|failure| {
-                    AppError::Invalid(format!("GIGA process failed: {}", failure.class))
-                })?;
+                resolve_sources_from_ledger(config, &event)
+                    .await
+                    .map_err(|failure| {
+                        AppError::Invalid(format!("GIGA process failed: {}", failure.class))
+                    })?;
                 return Ok(result);
             }
             ClaimState::WaitUntil(target) => {
@@ -1133,7 +1246,7 @@ pub async fn giga_process(
         };
         let source_hash = source_digest(&event);
         let event_hash = sha256_bytes(event.event_id().as_bytes());
-        let result = validate_source_bundle(&event, &request);
+        let result = resolve_sources_from_ledger(config, &event).await;
         let classified = match result {
             Ok(sources) => {
                 let existing_candidates: i64 = sqlx::query_scalar(
@@ -1250,7 +1363,8 @@ pub async fn giga_process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use house_core::{GigaLifecycle, GigaProcessSource, RoomKey};
+    use house_core::{GigaLifecycle, RoomKey};
+    use std::path::Path;
 
     fn conversation_event(
         room: &RoomKey,
@@ -1293,8 +1407,43 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn exact_source_bundle_recomputes_hashes_and_preserves_turn_order() {
+    fn source_config(directory: &Path, room: &str) -> Config {
+        Config {
+            database_url: "postgres://unused".into(),
+            embed_url: None,
+            embed_model: "unused".into(),
+            embed_dimension: 2_048,
+            embed_required: false,
+            test_embedding_disabled: true,
+            giga_source_ledger_dir: Some(directory.to_owned()),
+            giga_source_room: Some(room.into()),
+        }
+    }
+
+    async fn write_ledger(directory: &Path, records: &[Value]) {
+        fs::create_dir_all(directory).await.unwrap();
+        let body = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(directory.join("2026-07-24.jsonl"), format!("{body}\n"))
+            .await
+            .unwrap();
+    }
+
+    fn ledger_record(source_id: &str, role: &str, text: &str) -> Value {
+        json!({
+            "sessionID": "session-1",
+            "messageID": source_id,
+            "role": role,
+            "spirit": "Lab",
+            "text": text
+        })
+    }
+
+    #[tokio::test]
+    async fn persisted_source_loader_preserves_event_order_and_types_failures() {
         let room = RoomKey::new("lab").unwrap();
         let event = conversation_event(
             &room,
@@ -1304,27 +1453,64 @@ mod tests {
                 ("turn-2", "assistant", "exact assistant text"),
             ],
         );
-        let request = GigaProcessRequest::new(
-            "event-1".into(),
-            vec![
-                GigaProcessSource::new("turn-2".into(), "exact assistant text".into()).unwrap(),
-                GigaProcessSource::new("turn-1".into(), "exact user text".into()).unwrap(),
-            ],
-        )
-        .unwrap();
-        let resolved = validate_source_bundle(&event, &request).unwrap();
-        assert_eq!(resolved[0].source.source_id(), "turn-2");
-        assert_eq!(resolved[1].source.source_id(), "turn-1");
+        let directory = env::temp_dir().join(format!("giga-source-loader-{}", Uuid::new_v4()));
+        let config = source_config(&directory, "lab");
 
-        let tampered = GigaProcessRequest::new(
-            "event-1".into(),
-            vec![
-                GigaProcessSource::new("turn-1".into(), "changed".into()).unwrap(),
-                GigaProcessSource::new("turn-2".into(), "exact assistant text".into()).unwrap(),
+        write_ledger(
+            &directory,
+            &[
+                ledger_record("turn-2", "assistant", "exact assistant text"),
+                ledger_record("turn-1", "user", "exact user text"),
             ],
         )
-        .unwrap();
-        assert!(validate_source_bundle(&event, &tampered).is_err());
+        .await;
+        let resolved = resolve_sources_from_ledger(&config, &event).await.unwrap();
+        assert_eq!(resolved[0].source.source_id(), "turn-1");
+        assert_eq!(resolved[1].source.source_id(), "turn-2");
+
+        write_ledger(
+            &directory,
+            &[ledger_record("turn-1", "user", "exact user text")],
+        )
+        .await;
+        let missing = resolve_sources_from_ledger(&config, &event)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.class, "GigaSourceMissingError");
+
+        write_ledger(
+            &directory,
+            &[
+                ledger_record("turn-1", "user", "changed"),
+                ledger_record("turn-2", "assistant", "exact assistant text"),
+            ],
+        )
+        .await;
+        let mismatch = resolve_sources_from_ledger(&config, &event)
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.class, "GigaSourceHashMismatchError");
+
+        let oversized_text = "x".repeat(GIGA_MAX_PROCESS_SOURCE_BYTES + 1);
+        let oversized_event =
+            conversation_event(&room, None, &[("turn-large", "user", &oversized_text)]);
+        write_ledger(
+            &directory,
+            &[ledger_record("turn-large", "user", &oversized_text)],
+        )
+        .await;
+        let oversized = resolve_sources_from_ledger(&config, &oversized_event)
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.class, "GigaSourceWindowTooLargeError");
+
+        let wrong_room = source_config(&directory, "other-room");
+        let unverified = resolve_sources_from_ledger(&wrong_room, &event)
+            .await
+            .unwrap_err();
+        assert_eq!(unverified.class, "GigaSourceVerificationError");
+
+        fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]
@@ -1420,9 +1606,7 @@ mod tests {
     fn extraction_schema_keeps_rationale_before_gist() {
         let schema = extraction_schema(&["turn-1".into()], true).unwrap();
         let properties = schema.split("\"properties\":").nth(1).unwrap();
-        assert!(
-            properties.find("\"rationale\"").unwrap() < properties.find("\"gist\"").unwrap()
-        );
+        assert!(properties.find("\"rationale\"").unwrap() < properties.find("\"gist\"").unwrap());
     }
 
     #[test]

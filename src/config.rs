@@ -66,6 +66,8 @@ pub struct Config {
     pub embed_dimension: usize,
     pub embed_required: bool,
     pub test_embedding_disabled: bool,
+    pub giga_source_ledger_dir: Option<PathBuf>,
+    pub giga_source_room: Option<String>,
 }
 
 const DOTENV_PATH_OVERRIDE: &str = "SOLARISAEL_SUBSTRATE_DOTENV_PATH";
@@ -84,6 +86,10 @@ const EMBEDDING_ENV_KEYS: &[&str] = &[
     "SOLARISAEL_EMBED_DIMENSION",
     "SOLARISAEL_DISABLE_EMBEDDING",
     "SOLARISAEL_TEST_DISABLE_EMBEDDING",
+];
+const GIGA_SOURCE_ENV_KEYS: &[&str] = &[
+    "SOLARISAEL_GIGA_SOURCE_LEDGER_DIR",
+    "SOLARISAEL_GIGA_SOURCE_ROOM",
 ];
 
 struct Dotenv {
@@ -142,6 +148,7 @@ fn configuration_observed(dotenv: &Dotenv, reason: &str) -> Value {
     let keys = DATABASE_ENV_KEYS
         .iter()
         .chain(EMBEDDING_ENV_KEYS)
+        .chain(GIGA_SOURCE_ENV_KEYS)
         .copied()
         .collect::<BTreeSet<_>>();
     let dotenv_present_keys = keys
@@ -732,6 +739,9 @@ impl Config {
             embed_required: !test_embedding_disabled,
             test_embedding_disabled,
             embed_url,
+            giga_source_ledger_dir: configured_value("SOLARISAEL_GIGA_SOURCE_LEDGER_DIR", &dotenv)
+                .map(PathBuf::from),
+            giga_source_room: configured_value("SOLARISAEL_GIGA_SOURCE_ROOM", &dotenv),
         })
     }
 

@@ -2,18 +2,19 @@ use house_core::{
     GigaAuthority, GigaCandidate, GigaCandidateKind, GigaClassifierIdentity,
     GigaCodingLessonPromotionPayload, GigaEvent, GigaEventClaimRequest, GigaEventFinishOutcome,
     GigaEventFinishRequest, GigaEventReplayRequest, GigaEventType, GigaLifecycle,
-    GigaMemoryPromotionPayload, GigaProjectLessonPromotionPayload, GigaPromotionAuthority,
-    GigaPromotionKind, GigaPromotionPayload, GigaPromotionRequest, GigaPublicationConsent,
-    GigaQueueMaintenanceOperation, GigaQueueMaintenanceRequest, GigaQueueMaintenanceScope,
-    GigaQueueState, GigaResonance, GigaReviewAction, GigaReviewState, GigaScope, GigaScores,
-    GigaSourceRef, GigaSourceType, GigaVisibility, RoomKey,
+    GigaMemoryPromotionPayload, GigaProcessRequest, GigaProjectLessonPromotionPayload,
+    GigaPromotionAuthority, GigaPromotionKind, GigaPromotionPayload, GigaPromotionRequest,
+    GigaPublicationConsent, GigaQueueMaintenanceOperation, GigaQueueMaintenanceRequest,
+    GigaQueueMaintenanceScope, GigaQueueState, GigaResonance, GigaReviewAction, GigaReviewState,
+    GigaScope, GigaScores, GigaSourceRef, GigaSourceType, GigaVisibility, RoomKey,
 };
 use house_protocol::{GigaCandidateListParams, GigaHealthParams};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use solarisael_house_substrate::{
     Config, giga_candidate_list, giga_candidate_store, giga_event_claim, giga_event_finish,
-    giga_event_ingest, giga_event_replay, giga_health, giga_promote, giga_queue_maintenance,
-    giga_review,
+    giga_event_ingest, giga_event_replay, giga_health, giga_process, giga_promote,
+    giga_queue_maintenance, giga_review,
 };
 use sqlx::{
     PgPool, Row,
@@ -673,6 +674,106 @@ async fn stage_candidate_in_room(
         "promotion fixture must enter deliberate review",
     )?;
     Ok(source)
+}
+
+async fn persisted_process_contract(pool: &PgPool, cfg: &Config) -> TestResult {
+    let event_id = "process-persisted-source";
+    let session_id = "process-persisted-session";
+    let source_id = "process-persisted-turn";
+    let text = "exact persisted source text";
+    let content_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let scope = GigaScope::new(Some(ROOM.into()), None, GigaVisibility::Private, true)?;
+    let source = GigaSourceRef::new(
+        GigaSourceType::Turn,
+        source_id.into(),
+        "user".into(),
+        SOURCE_AT.into(),
+        content_hash,
+        scope.clone(),
+        None,
+    )?;
+    let event = GigaEvent::new(
+        event_id.into(),
+        GigaEventType::ConversationWindow,
+        RoomKey::new(ROOM)?,
+        session_id.into(),
+        vec![],
+        vec![source.clone()],
+        GigaLifecycle::conversation_window(),
+        EVENT_AT.into(),
+    )?;
+    require(
+        giga_event_ingest(pool, event).await?.accepted,
+        "persisted-source process event must be ingested",
+    )?;
+    let candidate = GigaCandidate::new(
+        "process-persisted-candidate".into(),
+        event_id.into(),
+        RoomKey::new(ROOM)?,
+        session_id.into(),
+        GigaCandidateKind::Memory,
+        vec![source],
+        vec![],
+        GigaScores::new(0.8, 0.7, 0.9, 0.95)?,
+        vec![],
+        vec![],
+        vec![],
+        vec!["persisted".into(), "source".into()],
+        "Persisted source candidate".into(),
+        "Source-grounded gist".into(),
+        "Source-grounded rationale".into(),
+        scope,
+        GigaAuthority::PointerOnly,
+        GigaReviewState::Unreviewed,
+        GigaClassifierIdentity::new(
+            "agents-a1".into(),
+            "ollama".into(),
+            "manifest-test".into(),
+            "prompt-test".into(),
+            "a".repeat(64),
+            "process-persisted-run".into(),
+            "2030-01-01T00:30:00Z".into(),
+        )?,
+        "2030-01-01T00:30:01Z".into(),
+        None,
+        vec![],
+    )?;
+    require(
+        giga_candidate_store(pool, candidate).await?.stored,
+        "persisted-source candidate must be stored",
+    )?;
+
+    let directory = std::env::temp_dir().join(format!("giga-process-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&directory).await?;
+    tokio::fs::write(
+        directory.join("2030-01-01.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "sessionID": session_id,
+                "messageID": source_id,
+                "role": "user",
+                "spirit": "Integration",
+                "text": text
+            })
+        ),
+    )
+    .await?;
+    let mut process_config = cfg.clone();
+    process_config.giga_source_ledger_dir = Some(directory.clone());
+    process_config.giga_source_room = Some(ROOM.into());
+    let result = giga_process(
+        pool,
+        &process_config,
+        GigaProcessRequest::new(event_id.into())?,
+    )
+    .await?;
+    require(
+        result.outcome == "succeeded" && result.candidate_count == 1 && result.attempt_count == 1,
+        "event-id-only process must reload exact persisted text and finish",
+    )?;
+    tokio::fs::remove_dir_all(directory).await?;
+    Ok(())
 }
 
 async fn stage_candidate(
@@ -1447,6 +1548,8 @@ async fn queue_and_atomic_promotion_contracts() {
         embed_dimension: 2_048,
         embed_required: false,
         test_embedding_disabled: true,
+        giga_source_ledger_dir: None,
+        giga_source_room: None,
     };
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -1483,6 +1586,8 @@ async fn queue_and_atomic_promotion_contracts() {
                     include_str!("../migrations/0003_giga.sql"),
                     include_str!("../migrations/0004_giga_runtime.sql"),
                     include_str!("../migrations/0005_giga_resonance.sql"),
+                    include_str!("../migrations/0006_memory_thread_graph.sql"),
+                    include_str!("../migrations/0007_giga_source_ordinal.sql"),
                 ] {
                     sqlx::raw_sql(migration).execute(&pool).await?;
                 }
@@ -1493,6 +1598,7 @@ async fn queue_and_atomic_promotion_contracts() {
                 queue_contracts(&pool).await?;
                 review_resonance_and_room_scope_contracts(&pool).await?;
                 promotion_contracts(&pool, &cfg).await?;
+                persisted_process_contract(&pool, &cfg).await?;
                 Ok(())
             }
             .await;

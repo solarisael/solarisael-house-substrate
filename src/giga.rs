@@ -64,17 +64,23 @@ fn range_parts(source: &GigaSourceRef) -> Result<(Option<i64>, Option<i64>), App
 async fn insert_event_source(
     tx: &mut Transaction<'_, Postgres>,
     event_id: &str,
+    source_ordinal: usize,
     source: &GigaSourceRef,
 ) -> Result<(), AppError> {
     let (room, project, visibility, review_required) = scope_parts(source);
     let (range_start, range_end) = range_parts(source)?;
     sqlx::query(
         "INSERT INTO giga_event_sources
-         (event_id, source_type, source_id, source_role, content_hash, scope_room, scope_project,
-          scope_visibility, publication_review_required, range_start, range_end, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+         (event_id, source_ordinal, source_type, source_id, source_role, content_hash,
+          scope_room, scope_project, scope_visibility, publication_review_required,
+          range_start, range_end, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(event_id)
+    .bind(
+        i32::try_from(source_ordinal)
+            .map_err(|_| AppError::Invalid("GIGA source ordinal exceeds database bounds".into()))?,
+    )
     .bind(source.source_type().as_str())
     .bind(source.source_id())
     .bind(source.role())
@@ -169,8 +175,8 @@ pub async fn giga_event_ingest(
             duplicate: true,
         });
     }
-    for source in event.source_refs() {
-        insert_event_source(&mut tx, event.event_id(), source).await?;
+    for (source_ordinal, source) in event.source_refs().iter().enumerate() {
+        insert_event_source(&mut tx, event.event_id(), source_ordinal, source).await?;
     }
     tx.commit().await?;
     Ok(GigaEventIngestResult {
@@ -1161,7 +1167,7 @@ pub(crate) async fn event_from_store(
         "SELECT source_type,source_id,source_role,content_hash,scope_room,scope_project,
                 scope_visibility,publication_review_required,range_start,range_end,
                 created_at AS source_created_at
-         FROM giga_event_sources WHERE event_id=$1 ORDER BY source_type,source_id",
+         FROM giga_event_sources WHERE event_id=$1 ORDER BY source_ordinal",
     )
     .bind(event_id)
     .fetch_all(&mut **tx)
