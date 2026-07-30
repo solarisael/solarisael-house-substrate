@@ -98,9 +98,9 @@ impl Serialize for RememberReceipt {
 
 impl RememberRequest {
     pub fn validate(&self) -> Result<(), AppError> {
-        if !ROOM_KEY_RE.is_match(&self.room) || self.room == "house" {
+        if !ROOM_KEY_RE.is_match(&self.room) || (self.room == "house" && self.kind != "memory") {
             return Err(AppError::Invalid(
-                "room must be a lowercase slug and cannot be house".into(),
+                "room must be a lowercase slug; house accepts only memory writes".into(),
             ));
         }
         let lessons = [

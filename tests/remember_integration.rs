@@ -723,3 +723,43 @@ fn spherical_kmeans_k1_uses_normalized_mean_centroid() {
     assert!((centroid[1] - expected).abs() < 1e-6);
     assert_eq!(groups[0].1.len(), 2);
 }
+
+fn validation_request(room: &str, kind: &str) -> RememberRequest {
+    serde_json::from_value(serde_json::json!({
+        "room": room,
+        "kind": kind,
+        "title": "validation probe",
+        "body": "validation body",
+    }))
+    .expect("request fixture must deserialize")
+}
+
+#[test]
+fn validate_accepts_house_room_for_memory_writes() {
+    assert!(validation_request("house", "memory").validate().is_ok());
+}
+
+#[test]
+fn validate_refuses_house_room_for_every_lesson_kind() {
+    for kind in [
+        "coding-lesson",
+        "project-lesson",
+        "writing-lesson",
+        "audio-lesson",
+    ] {
+        let error = validation_request("house", kind)
+            .validate()
+            .expect_err("house lesson writes must be refused");
+        assert!(
+            format!("{error:?}").contains("house accepts only memory writes"),
+            "unexpected refusal for {kind}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_still_refuses_non_slug_rooms() {
+    assert!(validation_request("House", "memory").validate().is_err());
+    assert!(validation_request("", "memory").validate().is_err());
+    assert!(validation_request("kodo", "memory").validate().is_ok());
+}
