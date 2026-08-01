@@ -8,13 +8,14 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Utc};
 use house_core::{
-    GIGA_MAX_EVENT_ATTEMPTS, GigaCandidate, GigaCandidateKind, GigaEvent, GigaEventClaimReceipt,
-    GigaEventClaimRequest, GigaEventFinishOutcome, GigaEventFinishReceipt, GigaEventFinishRequest,
-    GigaEventReplayReceipt, GigaEventReplayRequest, GigaEventType, GigaLifecycle,
-    GigaPromotionAuthority, GigaPromotionKind, GigaPromotionPayload, GigaPromotionReceipt,
-    GigaPromotionRequest, GigaQueueMaintenanceOperation, GigaQueueMaintenanceRequest,
-    GigaQueueMaintenanceScope, GigaQueueState, GigaResonance, GigaReviewAction, GigaReviewState,
-    GigaRisk, GigaScope, GigaSourceRange, GigaSourceRef, GigaSourceType, GigaVisibility, RoomKey,
+    GIGA_MAX_EVENT_ATTEMPTS, GigaAuthority, GigaCandidate, GigaCandidateKind, GigaEvent,
+    GigaEventClaimReceipt, GigaEventClaimRequest, GigaEventFinishOutcome, GigaEventFinishReceipt,
+    GigaEventFinishRequest, GigaEventReplayReceipt, GigaEventReplayRequest, GigaEventType,
+    GigaLifecycle, GigaPromotionAuthority, GigaPromotionKind, GigaPromotionPayload,
+    GigaPromotionReceipt, GigaPromotionRequest, GigaQueueMaintenanceOperation,
+    GigaQueueMaintenanceRequest, GigaQueueMaintenanceScope, GigaQueueState, GigaResonance,
+    GigaReviewAction, GigaReviewState, GigaRisk, GigaScope, GigaSourceRange, GigaSourceRef,
+    GigaSourceType, GigaVisibility, RoomKey,
 };
 use house_protocol::{
     GigaCandidateListRequest, GigaCandidateListResult, GigaCandidateParams,
@@ -432,7 +433,15 @@ pub async fn giga_candidate_list(
                 visibility: row.try_get("scope_visibility")?,
                 publication_review_required: row.try_get("publication_review_required")?,
             },
-            authority: row.try_get::<String, _>("authority")?.replace('_', "-"),
+            authority: {
+                let stored = row.try_get::<String, _>("authority")?.replace('_', "-");
+                GigaAuthority::parse(&stored)
+                    .map_err(|_| {
+                        AppError::Invalid(format!("GIGA candidate authority is invalid: {stored}"))
+                    })?
+                    .as_str()
+                    .to_string()
+            },
             review_state: row.try_get("review_state")?,
             classifier: GigaClassifierParams {
                 model: row.try_get("classifier_model")?,

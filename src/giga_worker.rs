@@ -18,14 +18,14 @@ use serde_json::{Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, env, sync::LazyLock, time::Duration};
-use tokio::{fs, time::sleep};
+use tokio::fs;
 use uuid::Uuid;
 
-pub const GIGA_PROMPT_VERSION: &str = "agents-a1-two-pass-v1";
+pub const GIGA_PROMPT_VERSION: &str = "agents-a1-two-pass-v2";
 pub const GIGA_MODEL_TAG: &str = "hf.co/InternScience/Agents-A1-4B-Q4_K_M-GGUF:latest";
 pub const GIGA_MODEL_MANIFEST_DIGEST: &str =
     "96ca1ea02b302bf5cd1118d637f12a5af7c2a5aa465837532448bd6e54db4ceb";
-const GIGA_DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11435";
+const GIGA_DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 const GIGA_LEASE_SECONDS: i64 = 300;
 const GIGA_RETRY_DELAY_SECONDS: u32 = 30;
 const GIGA_MODEL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -73,7 +73,7 @@ pub const GIGA_GATE_PROMPT: &str = concat!(
     "Ordinary continuity with no new meaning, greetings, repeated status, tool noise, unsupported ",
     "opinions, and abandoned hypotheticals are none. Use only supplied source_id values. For ",
     "kind=none source_ids must be empty; otherwise include the minimal exact supporting IDs. ",
-    "Do not emit reasoning outside the JSON.\n\n",
+    "Keep reason to one short sentence. Do not emit reasoning outside the JSON.\n\n",
     "Few-shot examples:\n",
     "1. New consent boundary -> memory.\n",
     "2. Explicit project rule with project key -> project_lesson.\n",
@@ -206,7 +206,11 @@ enum ClaimState {
         event: GigaEvent,
         attempt_count: u32,
     },
-    WaitUntil(DateTime<Utc>),
+    WaitUntil {
+        attempt_count: u32,
+        candidate_count: u32,
+        last_error: Option<String>,
+    },
     Terminal {
         event: GigaEvent,
         result: GigaProcessResult,
@@ -567,7 +571,27 @@ async fn request_ollama_structured<T: for<'de> Deserialize<'de>>(
     {
         return Err(WorkerFailure::new("GigaOllamaResponseError", true));
     }
-    serde_json::from_str(content).map_err(|_| WorkerFailure::new("GigaClassifierOutputError", true))
+    if let Ok(value) = serde_json::from_str(content) {
+        return Ok(value);
+    }
+    salvage_json_slice(content)
+        .and_then(|slice| serde_json::from_str(slice).ok())
+        .ok_or_else(|| WorkerFailure::new("GigaClassifierOutputError", true))
+}
+
+/// Agents-A1-4B sometimes emits a "Thinking Process:" prose preamble inside
+/// `content` instead of the `thinking` field. Salvage the embedded JSON by
+/// slicing from the first `{` to the last `}` (or `[`..`]` when no brace pair)
+/// before giving up on the classifier output.
+fn salvage_json_slice(content: &str) -> Option<&str> {
+    for (open, close) in [('{', '}'), ('[', ']')] {
+        if let Some((start, end)) = content.find(open).zip(content.rfind(close)) {
+            if start < end {
+                return Some(&content[start..=end]);
+            }
+        }
+    }
+    None
 }
 
 fn exact_unique_subset(values: &[String], allowed: &[String], allow_empty: bool) -> bool {
@@ -577,6 +601,23 @@ fn exact_unique_subset(values: &[String], allowed: &[String], allow_empty: bool)
             .iter()
             .enumerate()
             .all(|(index, value)| allowed.contains(value) && !values[..index].contains(value))
+}
+
+/// Ollama's JSON-Schema-to-GBNF conversion does not enforce `uniqueItems`, so
+/// the model can emit the same source ID twice (observed 2026-07-31 on
+/// proof_source_ids). Duplicate IDs are navigation-aid redundancy, not an
+/// authority violation: dedupe preserving order, then let exact_unique_subset
+/// keep its sharp refusal for genuinely out-of-set IDs.
+fn dedupe_preserving_order(values: &mut Vec<String>) {
+    let mut seen = Vec::with_capacity(values.len());
+    values.retain(|value| {
+        if seen.contains(value) {
+            false
+        } else {
+            seen.push(value.clone());
+            true
+        }
+    });
 }
 
 fn bounded_trimmed(value: &str, maximum: usize) -> bool {
@@ -606,7 +647,7 @@ fn validate_gate(gate: &GateOutput, event: &GigaEvent) -> Result<(), WorkerFailu
         .iter()
         .map(|source| source.source_id().to_owned())
         .collect::<Vec<_>>();
-    if !bounded_trimmed(&gate.reason, 160)
+    if !bounded_trimmed(&gate.reason, 1_024)
         || !exact_unique_subset(&gate.source_ids, &source_ids, gate.kind == GateKind::None)
         || (gate.kind == GateKind::None && !gate.source_ids.is_empty())
         || (gate.kind != GateKind::None && gate.source_ids.is_empty())
@@ -864,7 +905,7 @@ async fn classify_event(
         .iter()
         .map(|source| source.source_id.to_owned())
         .collect::<Vec<_>>();
-    let gate: GateOutput = request_ollama_structured(
+    let mut gate: GateOutput = request_ollama_structured(
         &config,
         GIGA_GATE_PROMPT,
         json!({
@@ -875,11 +916,12 @@ async fn classify_event(
         256,
     )
     .await?;
+    dedupe_preserving_order(&mut gate.source_ids);
     validate_gate(&gate, event)?;
     if gate.kind == GateKind::None {
         return Ok(None);
     }
-    let extraction: ExtractionOutput = request_ollama_structured(
+    let mut extraction: ExtractionOutput = request_ollama_structured(
         &config,
         GIGA_EXTRACTION_PROMPT,
         json!({
@@ -892,6 +934,8 @@ async fn classify_event(
         768,
     )
     .await?;
+    dedupe_preserving_order(&mut extraction.source_ids);
+    dedupe_preserving_order(&mut extraction.proof_source_ids);
     validate_extraction(&extraction, &gate)?;
     let rationale = truncate_with_marker(
         &extraction.rationale,
@@ -1040,7 +1084,13 @@ async fn claim_exact(pool: &PgPool, event_id: &str) -> Result<ClaimState, AppErr
             .ok_or_else(|| AppError::Invalid("running GIGA event has no lease expiry".into()))?;
         if lease_expires_at > claimed_at {
             tx.commit().await?;
-            return Ok(ClaimState::WaitUntil(lease_expires_at));
+            return Ok(ClaimState::WaitUntil {
+                attempt_count: u32::try_from(previous_attempt)
+                    .map_err(|_| AppError::Invalid("GIGA attempt count is invalid".into()))?,
+                candidate_count: u32::try_from(candidate_count)
+                    .map_err(|_| AppError::Invalid("GIGA candidate count is invalid".into()))?,
+                last_error: row.try_get("last_error")?,
+            });
         }
         sqlx::query(
             "UPDATE giga_event_attempts
@@ -1066,7 +1116,13 @@ async fn claim_exact(pool: &PgPool, event_id: &str) -> Result<ClaimState, AppErr
         let available_at: DateTime<Utc> = row.try_get("available_at")?;
         if available_at > claimed_at {
             tx.commit().await?;
-            return Ok(ClaimState::WaitUntil(available_at));
+            return Ok(ClaimState::WaitUntil {
+                attempt_count: u32::try_from(previous_attempt)
+                    .map_err(|_| AppError::Invalid("GIGA attempt count is invalid".into()))?,
+                candidate_count: u32::try_from(candidate_count)
+                    .map_err(|_| AppError::Invalid("GIGA candidate count is invalid".into()))?,
+                last_error: row.try_get("last_error")?,
+            });
         }
     }
     if previous_attempt >= GIGA_MAX_EVENT_ATTEMPTS as i32 {
@@ -1213,149 +1269,143 @@ fn source_digest(event: &GigaEvent) -> String {
     format!("{:x}", digest.finalize())
 }
 
-async fn wait_until(target: DateTime<Utc>) {
-    let delay = (target - Utc::now())
-        .to_std()
-        .unwrap_or_else(|_| Duration::from_millis(1));
-    sleep(delay.min(Duration::from_secs(GIGA_LEASE_SECONDS as u64))).await;
-}
-
 pub async fn giga_process(
     pool: &PgPool,
     config: &Config,
     request: GigaProcessRequest,
 ) -> Result<GigaProcessResult, AppError> {
-    loop {
-        let (event, attempt_count) = match claim_exact(pool, request.event_id()).await? {
-            ClaimState::Terminal { event, result } => {
-                resolve_sources_from_ledger(config, &event)
-                    .await
-                    .map_err(|failure| {
-                        AppError::Invalid(format!("GIGA process failed: {}", failure.class))
-                    })?;
-                return Ok(result);
-            }
-            ClaimState::WaitUntil(target) => {
-                wait_until(target).await;
-                continue;
-            }
-            ClaimState::Claimed {
-                event,
+    let (event, attempt_count) = match claim_exact(pool, request.event_id()).await? {
+        ClaimState::Terminal { event, result } => {
+            resolve_sources_from_ledger(config, &event)
+                .await
+                .map_err(|failure| {
+                    AppError::Invalid(format!("GIGA process failed: {}", failure.class))
+                })?;
+            return Ok(result);
+        }
+        ClaimState::WaitUntil {
+            attempt_count,
+            candidate_count,
+            last_error,
+        } => {
+            return Ok(GigaProcessResult {
+                event_id: request.event_id().into(),
+                outcome: GigaEventFinishOutcome::Retry.as_str().into(),
+                candidate_count,
                 attempt_count,
-            } => (event, attempt_count),
-        };
-        let source_hash = source_digest(&event);
-        let event_hash = sha256_bytes(event.event_id().as_bytes());
-        let result = resolve_sources_from_ledger(config, &event).await;
-        let classified = match result {
-            Ok(sources) => {
-                let existing_candidates: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*)::bigint FROM giga_candidates WHERE event_id=$1",
-                )
-                .bind(event.event_id())
-                .fetch_one(pool)
-                .await?;
-                match existing_candidates {
-                    0 => classify_event(&event, &sources).await,
-                    1 => {
-                        tracing::info!(
-                            operation = "giga_process",
-                            event_hash = %event_hash,
-                            source_hash = %source_hash,
-                            source_count = event.source_refs().len(),
-                            candidate_count = 1,
-                            outcome = "succeeded",
-                            recovery = "existing_candidate",
-                            model = GIGA_MODEL_TAG,
-                            model_digest = GIGA_MODEL_MANIFEST_DIGEST,
-                            prompt_version = GIGA_PROMPT_VERSION,
-                        );
-                        return finish_attempt(
-                            pool,
-                            &event,
-                            attempt_count,
-                            GigaEventFinishOutcome::Succeeded,
-                            1,
-                            None,
-                        )
-                        .await;
-                    }
-                    _ => {
-                        return Err(AppError::Invalid(
-                            "GIGA event has more than one durable candidate".into(),
-                        ));
-                    }
+                error_class: RequiredNullable(last_error),
+            });
+        }
+        ClaimState::Claimed {
+            event,
+            attempt_count,
+        } => (event, attempt_count),
+    };
+    let source_hash = source_digest(&event);
+    let event_hash = sha256_bytes(event.event_id().as_bytes());
+    let result = resolve_sources_from_ledger(config, &event).await;
+    let classified = match result {
+        Ok(sources) => {
+            let existing_candidates: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM giga_candidates WHERE event_id=$1",
+            )
+            .bind(event.event_id())
+            .fetch_one(pool)
+            .await?;
+            match existing_candidates {
+                0 => classify_event(&event, &sources).await,
+                1 => {
+                    tracing::info!(
+                        operation = "giga_process",
+                        event_hash = %event_hash,
+                        source_hash = %source_hash,
+                        source_count = event.source_refs().len(),
+                        candidate_count = 1,
+                        outcome = "succeeded",
+                        recovery = "existing_candidate",
+                        model = GIGA_MODEL_TAG,
+                        model_digest = GIGA_MODEL_MANIFEST_DIGEST,
+                        prompt_version = GIGA_PROMPT_VERSION,
+                    );
+                    return finish_attempt(
+                        pool,
+                        &event,
+                        attempt_count,
+                        GigaEventFinishOutcome::Succeeded,
+                        1,
+                        None,
+                    )
+                    .await;
+                }
+                _ => {
+                    return Err(AppError::Invalid(
+                        "GIGA event has more than one durable candidate".into(),
+                    ));
                 }
             }
-            Err(failure) => Err(failure),
-        };
-        match classified {
-            Ok(None) => {
-                let result = finish_attempt(
-                    pool,
-                    &event,
-                    attempt_count,
-                    GigaEventFinishOutcome::Succeeded,
-                    0,
-                    None,
-                )
-                .await?;
-                tracing::info!(
-                    operation = "giga_process",
-                    event_hash = %event_hash,
-                    source_hash = %source_hash,
-                    source_count = event.source_refs().len(),
-                    candidate_count = 0,
-                    outcome = "succeeded",
-                    model = GIGA_MODEL_TAG,
-                    model_digest = GIGA_MODEL_MANIFEST_DIGEST,
-                    prompt_version = GIGA_PROMPT_VERSION,
-                );
-                return Ok(result);
-            }
-            Ok(Some(candidate)) => {
-                let result =
-                    store_candidate_and_finish(pool, &event, attempt_count, candidate).await?;
-                tracing::info!(
-                    operation = "giga_process",
-                    event_hash = %event_hash,
-                    source_hash = %source_hash,
-                    source_count = event.source_refs().len(),
-                    candidate_count = 1,
-                    outcome = "succeeded",
-                    model = GIGA_MODEL_TAG,
-                    model_digest = GIGA_MODEL_MANIFEST_DIGEST,
-                    prompt_version = GIGA_PROMPT_VERSION,
-                );
-                return Ok(result);
-            }
-            Err(failure) => {
-                let retry = failure.retryable && attempt_count < GIGA_MAX_EVENT_ATTEMPTS;
-                let outcome = if retry {
-                    GigaEventFinishOutcome::Retry
-                } else {
-                    GigaEventFinishOutcome::Failed
-                };
-                tracing::warn!(
-                    operation = "giga_process",
-                    event_hash = %event_hash,
-                    source_hash = %source_hash,
-                    source_count = event.source_refs().len(),
-                    candidate_count = 0,
-                    outcome = outcome.as_str(),
-                    error_class = failure.class,
-                    model = GIGA_MODEL_TAG,
-                    model_digest = GIGA_MODEL_MANIFEST_DIGEST,
-                    prompt_version = GIGA_PROMPT_VERSION,
-                );
-                let finished =
-                    finish_attempt(pool, &event, attempt_count, outcome, 0, Some(failure.class))
-                        .await?;
-                if retry {
-                    continue;
-                }
-                return Ok(finished);
-            }
+        }
+        Err(failure) => Err(failure),
+    };
+    match classified {
+        Ok(None) => {
+            let result = finish_attempt(
+                pool,
+                &event,
+                attempt_count,
+                GigaEventFinishOutcome::Succeeded,
+                0,
+                None,
+            )
+            .await?;
+            tracing::info!(
+                operation = "giga_process",
+                event_hash = %event_hash,
+                source_hash = %source_hash,
+                source_count = event.source_refs().len(),
+                candidate_count = 0,
+                outcome = "succeeded",
+                model = GIGA_MODEL_TAG,
+                model_digest = GIGA_MODEL_MANIFEST_DIGEST,
+                prompt_version = GIGA_PROMPT_VERSION,
+            );
+            Ok(result)
+        }
+        Ok(Some(candidate)) => {
+            let result =
+                store_candidate_and_finish(pool, &event, attempt_count, candidate).await?;
+            tracing::info!(
+                operation = "giga_process",
+                event_hash = %event_hash,
+                source_hash = %source_hash,
+                source_count = event.source_refs().len(),
+                candidate_count = 1,
+                outcome = "succeeded",
+                model = GIGA_MODEL_TAG,
+                model_digest = GIGA_MODEL_MANIFEST_DIGEST,
+                prompt_version = GIGA_PROMPT_VERSION,
+            );
+            Ok(result)
+        }
+        Err(failure) => {
+            let retry = failure.retryable && attempt_count < GIGA_MAX_EVENT_ATTEMPTS;
+            let outcome = if retry {
+                GigaEventFinishOutcome::Retry
+            } else {
+                GigaEventFinishOutcome::Failed
+            };
+            tracing::warn!(
+                operation = "giga_process",
+                event_hash = %event_hash,
+                source_hash = %source_hash,
+                source_count = event.source_refs().len(),
+                candidate_count = 0,
+                outcome = outcome.as_str(),
+                error_class = failure.class,
+                model = GIGA_MODEL_TAG,
+                model_digest = GIGA_MODEL_MANIFEST_DIGEST,
+                prompt_version = GIGA_PROMPT_VERSION,
+            );
+            finish_attempt(pool, &event, attempt_count, outcome, 0, Some(failure.class)).await
         }
     }
 }
@@ -1440,6 +1490,20 @@ mod tests {
             "spirit": "Lab",
             "text": text
         })
+    }
+
+    #[test]
+    fn classifier_salvage_parse_strips_thinking_preamble() {
+        let content = "Thinking Process:\n1. blah\n{\"foo\":1}";
+        assert!(serde_json::from_str::<Value>(content).is_err());
+        let salvaged = salvage_json_slice(content).expect("object slice");
+        assert_eq!(salvaged, "{\"foo\":1}");
+        assert_eq!(
+            serde_json::from_str::<Value>(salvaged).unwrap(),
+            json!({ "foo": 1 })
+        );
+        assert_eq!(salvage_json_slice("preamble [1,2]"), Some("[1,2]"));
+        assert_eq!(salvage_json_slice("no json here"), None);
     }
 
     #[tokio::test]

@@ -117,13 +117,25 @@ fn query_dates(query: &str) -> Vec<NaiveDate> {
         .collect()
 }
 pub(crate) fn query_terms(query: &str) -> Vec<String> {
-    query
+    let mut terms = query
         .split(|c: char| !c.is_alphanumeric())
         .map(|term| term.trim().to_lowercase())
         .filter(|term| term.len() >= 2)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .collect::<BTreeSet<_>>();
+    // Compound tokens split only on whitespace so `-`, `/`, `.`, `_` survive
+    // inside a token (pais/mais, queue-maintenance); edge punctuation that is
+    // not part of a compound (quotes, commas, trailing periods) is trimmed.
+    terms.extend(
+        query
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|token| token.len() >= 2),
+    );
+    terms.into_iter().collect()
 }
 
 pub(crate) fn term_evidence(terms: &[String], fields: &[&str]) -> (Vec<String>, Vec<String>) {
@@ -484,6 +496,34 @@ pub async fn recall(
                 ],
             );
             semantic_chunks.push(serde_json::json!({"memory_id":row.try_get::<i64,_>("memory_id")?,"source_path":source_path,"title":title,"heading_path":heading_path,"body":bounded_excerpt(&body),"char_start":row.try_get::<i32,_>("char_start")?,"char_end":row.try_get::<i32,_>("char_end")?,"chunk_index":row.try_get::<i32,_>("chunk_index")?,"sim":sim,"durability":durability,"temporal_weight":temporal_weight,"matched_terms":matched_terms,"missing_terms":missing_terms,"term_coverage":coverage,"evidence":"semantic cosine similarity"}));
+        }
+        if semantic_chunks.is_empty() {
+            // The floor query returned nothing; a second cheap roundtrip is
+            // acceptable only in this empty case so silence is impossible.
+            let top_sim: Option<f64> = sqlx::query_scalar(
+                r#"SELECT MAX((1-(c.body_embedding <=> $1::vector))::double precision)
+                   FROM memory_chunks c
+                   JOIN memories m ON m.id=c.memory_id
+                   WHERE m.room = ANY($2::text[])
+                     AND m.archived_at IS NULL
+                     AND m.superseded_by IS NULL
+                     AND c.body_embedding IS NOT NULL"#,
+            )
+            .bind(&vector_text)
+            .bind(&rooms)
+            .fetch_one(pool)
+            .await?;
+            warnings.push(match top_sim {
+                Some(top) => format!(
+                    "semantic lane empty: top sim {top:.2} < floor {:.2} (rooms {})",
+                    params.semantic_min_similarity,
+                    rooms.join(",")
+                ),
+                None => format!(
+                    "semantic lane empty: no embedded chunks (rooms {})",
+                    rooms.join(",")
+                ),
+            });
         }
     }
     let content_rows = sqlx::query("SELECT m.id AS memory_id,m.source_path,coalesce(m.title,'') AS title,coalesce(c.heading_path,'') AS heading_path,c.body,c.char_start,c.char_end,c.chunk_index,m.meta AS meta,word_similarity($1,c.body)::double precision AS sim FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.room = ANY($2::text[]) AND m.archived_at IS NULL AND m.superseded_by IS NULL AND ($5::text[] = '{}'::text[] OR c.body ILIKE ANY($5::text[])) AND word_similarity($1,c.body) >= $3 ORDER BY sim DESC,m.source_path,c.chunk_index LIMIT $4")

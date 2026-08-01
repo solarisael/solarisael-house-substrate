@@ -196,15 +196,25 @@ mod tests {
             vec![
                 "07".to_string(),
                 "2026".to_string(),
+                "2026-07-22".to_string(),
                 "22".to_string(),
                 "alpha".to_string()
             ]
         );
+        let compound = query_terms("the pais/mais thingie");
+        for expected in ["pais/mais", "pais", "mais", "the", "thingie"] {
+            assert!(compound.iter().any(|t| t == expected), "missing {expected}");
+        }
         let (matched, missing) = term_evidence(&terms, &["An alpha memory"]);
         assert_eq!(matched, vec!["alpha".to_string()]);
         assert_eq!(
             missing,
-            vec!["07".to_string(), "2026".to_string(), "22".to_string()]
+            vec![
+                "07".to_string(),
+                "2026".to_string(),
+                "2026-07-22".to_string(),
+                "22".to_string()
+            ]
         );
         let candidate = serde_json::json!({"matched_terms": matched, "missing_terms": missing, "body_excerpt": "An alpha memory"});
         assert!(candidate.get("matched_terms").is_some());

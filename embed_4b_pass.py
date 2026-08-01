@@ -42,7 +42,7 @@ def configure_embedding() -> None:
 
     EMBED_URL = _os.environ.get(
         "SOLARISAEL_EMBED_URL",
-        _os.environ.get("SOLARISAEL_LMSTUDIO_URL", "http://localhost:11435/api/embed"),
+        _os.environ.get("SOLARISAEL_LMSTUDIO_URL", "http://localhost:11434/api/embed"),
     )
     EMBED_MODEL = _os.environ.get(
         "SOLARISAEL_EMBED_MODEL",

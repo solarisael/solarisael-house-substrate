@@ -20,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 
-const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:11435/api/embed";
+const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:11434/api/embed";
 const DEFAULT_EMBED_MODEL: &str = "hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest";
 pub(crate) const EMBED_DIMENSION: usize = 2048;
 pub(crate) static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
@@ -134,10 +134,17 @@ impl Dotenv {
 }
 
 fn dotenv_target() -> PathBuf {
-    env::var_os(DOTENV_PATH_OVERRIDE)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".env"))
+    if let Some(path) = env::var_os(DOTENV_PATH_OVERRIDE).filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(candidate) = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(".env")))
+        .filter(|path| path.is_file())
+    {
+        return candidate;
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(".env")
 }
 
 fn configured_value(key: &str, dotenv: &Dotenv) -> Option<String> {
