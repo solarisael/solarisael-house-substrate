@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct write helper for solarisael_memory.coding_lessons."""
+"""Direct write helper for coding lessons."""
 from __future__ import annotations
 
 import argparse
@@ -87,14 +87,14 @@ def main() -> int:
         with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                INSERT INTO coding_lessons
-                  (scope, project, title, lesson, trigger_context, proof_pattern,
+                INSERT INTO lessons
+                  (lesson_key, scope, project, title, lesson, trigger_context, proof_pattern,
                    tags, source_memory_path, source_lines_start, source_lines_end, meta,
                    shape, voice, negation_of, always_on)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                  ('coding', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
                    %s, %s, %s, %s)
-                ON CONFLICT (scope, project, title) DO UPDATE SET
+                ON CONFLICT (scope, project, title) WHERE lesson_key = 'coding' DO UPDATE SET
                   lesson = EXCLUDED.lesson,
                   trigger_context = EXCLUDED.trigger_context,
                   proof_pattern = EXCLUDED.proof_pattern,

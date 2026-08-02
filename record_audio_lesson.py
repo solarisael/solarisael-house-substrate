@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct write helper for audio_lessons. Parallels record_writing_lesson.py.
+"""Direct write helper for audio lessons. Parallels the writing lesson helper.
 
 Audio-domain axes:
   --stage S       pipeline stage the rule applies to; repeatable
@@ -69,7 +69,10 @@ def resolve_negation_id(cur, *, neg_id, neg_title):
     if neg_id is not None:
         return neg_id
     if neg_title:
-        cur.execute("SELECT id FROM audio_lessons WHERE title = %s", (neg_title,))
+        cur.execute(
+            "SELECT id FROM lessons WHERE lesson_key = 'audio' AND title = %s",
+            (neg_title,),
+        )
         row = cur.fetchone()
         if row:
             return row["id"]
@@ -81,11 +84,11 @@ def upsert(cur, a) -> dict:
     negation_of = resolve_negation_id(cur, neg_id=a.negation_of_id, neg_title=a.negation_of_title)
     cur.execute(
         """
-        INSERT INTO audio_lessons
-          (shape, stage, title, lesson, trigger_context, example_cmd,
+        INSERT INTO lessons
+          (lesson_key, shape, stage, title, lesson, trigger_context, example_cmd,
            tools, negation_of, tags, source_memory_path)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (title) DO UPDATE SET
+        VALUES ('audio', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (title) WHERE lesson_key = 'audio' DO UPDATE SET
           shape = EXCLUDED.shape, stage = EXCLUDED.stage,
           lesson = EXCLUDED.lesson, trigger_context = EXCLUDED.trigger_context,
           example_cmd = EXCLUDED.example_cmd, tools = EXCLUDED.tools,

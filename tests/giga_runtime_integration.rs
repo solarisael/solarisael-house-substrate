@@ -1031,8 +1031,8 @@ async fn candidate_effects(pool: &PgPool, candidate_id: &str) -> TestResult<Cand
     let row: (i64, i64, i64, i64, String, Json<Vec<String>>) = sqlx::query_as(
         "SELECT
            (SELECT count(*)::bigint FROM memories WHERE meta->>'candidate_id'=$1),
-           (SELECT count(*)::bigint FROM coding_lessons WHERE meta->>'candidate_id'=$1),
-           (SELECT count(*)::bigint FROM project_lessons WHERE meta->>'candidate_id'=$1),
+           (SELECT count(*)::bigint FROM lessons WHERE lesson_key='coding' AND meta->>'candidate_id'=$1),
+           (SELECT count(*)::bigint FROM lessons WHERE lesson_key='project' AND meta->>'candidate_id'=$1),
            (SELECT count(*)::bigint FROM giga_reviews WHERE candidate_id=$1 AND action='promote'),
            review_state,promotion_refs
          FROM giga_candidates WHERE candidate_id=$1",
@@ -1170,8 +1170,8 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
     )
     .await?;
     let existing_coding_id: i64 = sqlx::query_scalar(
-        "INSERT INTO coding_lessons (scope,title,lesson,tags,meta)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id",
+        "INSERT INTO lessons (lesson_key,scope,title,lesson,tags,meta)
+         VALUES ('coding',$1,$2,$3,$4,$5) RETURNING id",
     )
     .bind(ROOM)
     .bind("Verify atomic writes")
@@ -1212,7 +1212,7 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
     )?;
     let coding_row = sqlx::query(
         "SELECT scope,title,lesson,shape,proof_pattern,trigger_context,tags,meta
-         FROM coding_lessons WHERE id=$1",
+         FROM lessons WHERE lesson_key='coding' AND id=$1",
     )
     .bind(i64::try_from(coding_receipt.durable_id())?)
     .fetch_one(pool)
@@ -1250,8 +1250,8 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
     )
     .await?;
     let existing_project_id: i64 = sqlx::query_scalar(
-        "INSERT INTO project_lessons (project,title,lesson,tags,meta)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id",
+        "INSERT INTO lessons (lesson_key,project,title,lesson,tags,meta)
+         VALUES ('project',$1,$2,$3,$4,$5) RETURNING id",
     )
     .bind(PROJECT)
     .bind("Use the isolated database guard")
@@ -1292,7 +1292,7 @@ async fn promotion_contracts(pool: &PgPool, cfg: &Config) -> TestResult {
     )?;
     let project_row = sqlx::query(
         "SELECT project,title,lesson,proof_pattern,trigger_context,tags,meta
-         FROM project_lessons WHERE id=$1",
+         FROM lessons WHERE lesson_key='project' AND id=$1",
     )
     .bind(i64::try_from(project_receipt.durable_id())?)
     .fetch_one(pool)

@@ -198,7 +198,7 @@ impl RememberRequest {
             };
             if unsupported {
                 return Err(AppError::Invalid(
-                    "lesson fields are unsupported by this lesson table".into(),
+                    "lesson fields are unsupported by this lesson key".into(),
                 ));
             }
             if self.kind == "project-lesson"
@@ -533,11 +533,11 @@ pub(crate) async fn write_coding_lesson_tx(
     meta: Value,
 ) -> Result<i64, AppError> {
     sqlx::query_scalar(
-        "INSERT INTO coding_lessons
-         (scope,project,voice,shape,title,lesson,trigger_context,proof_pattern,tags,
+        "INSERT INTO lessons
+         (lesson_key,scope,project,voice,shape,title,lesson,trigger_context,proof_pattern,tags,
           source_memory_path,meta)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (scope,project,title) DO UPDATE
+         VALUES ('coding',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (scope,project,title) WHERE lesson_key='coding' DO UPDATE
          SET project=EXCLUDED.project,voice=EXCLUDED.voice,shape=EXCLUDED.shape,
              lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,
              proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,
@@ -573,10 +573,10 @@ pub(crate) async fn write_project_lesson_tx(
     meta: Value,
 ) -> Result<i64, AppError> {
     sqlx::query_scalar(
-        "INSERT INTO project_lessons
-         (project,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT (project,title) DO UPDATE
+        "INSERT INTO lessons
+         (lesson_key,scope,project,title,lesson,trigger_context,proof_pattern,tags,source_memory_path,meta)
+         VALUES ('project','project',$1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (project,title) WHERE lesson_key='project' DO UPDATE
          SET lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,
              proof_pattern=EXCLUDED.proof_pattern,tags=EXCLUDED.tags,
              source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta
@@ -642,10 +642,10 @@ async fn remember_lesson(
             meta,
         )
         .await?,
-        "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO writing_lessons (voice,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (voice,title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+        "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,voice,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('writing','house',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (voice,title) WHERE lesson_key='writing' DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
             .bind(req.voice.as_deref().unwrap_or("general")).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
-        "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO audio_lessons (shape,title,lesson,trigger_context,tags,source_memory_path) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (title) DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path RETURNING id")
-            .bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).fetch_one(&mut *tx).await?,
+        "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('audio','house',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (title) WHERE lesson_key='audio' DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         _ => return Err(AppError::Invalid("unsupported remember kind".into())),
     };
     tx.commit().await?;

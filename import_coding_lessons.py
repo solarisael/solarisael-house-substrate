@@ -152,8 +152,9 @@ def find_lesson(
     cur.execute(
         """
         SELECT id, negation_of
-        FROM coding_lessons
-        WHERE scope = %s
+        FROM lessons
+        WHERE lesson_key = 'coding'
+          AND scope = %s
           AND project IS NOT DISTINCT FROM %s
           AND title = %s
         """,
@@ -173,11 +174,11 @@ def find_existing(cur: Any, lesson: dict[str, Any]) -> int | None:
 def insert_lesson(cur: Any, lesson: dict[str, Any]) -> None:
     cur.execute(
         """
-        INSERT INTO coding_lessons
-          (scope, project, title, lesson, trigger_context, proof_pattern,
+        INSERT INTO lessons
+          (lesson_key, scope, project, title, lesson, trigger_context, proof_pattern,
            tags, meta, shape, voice, always_on)
         VALUES
-          (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+          ('coding', %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
         """,
         (
             lesson["scope"],
@@ -198,7 +199,7 @@ def insert_lesson(cur: Any, lesson: dict[str, Any]) -> None:
 def update_lesson(cur: Any, lesson_id: int, lesson: dict[str, Any]) -> None:
     cur.execute(
         """
-        UPDATE coding_lessons
+        UPDATE lessons
         SET lesson = %s,
             trigger_context = %s,
             proof_pattern = %s,
@@ -207,7 +208,7 @@ def update_lesson(cur: Any, lesson_id: int, lesson: dict[str, Any]) -> None:
             shape = %s,
             voice = %s,
             always_on = %s
-        WHERE id = %s
+        WHERE lesson_key = 'coding' AND id = %s
         """,
         (
             lesson["lesson"],
@@ -248,7 +249,7 @@ def link_negations(
             counts["link_skipped"] += 1
             continue
         cur.execute(
-            "UPDATE coding_lessons SET negation_of = %s WHERE id = %s",
+            "UPDATE lessons SET negation_of = %s WHERE lesson_key = 'coding' AND id = %s",
             (target_id, source_id),
         )
         counts["linked"] += 1

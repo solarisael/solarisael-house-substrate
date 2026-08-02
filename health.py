@@ -36,10 +36,7 @@ REQUIRED_TABLES = (
     "thread_event_links",
     "memory_chunks",
     "named_entities",
-    "coding_lessons",
-    "project_lessons",
-    "writing_lessons",
-    "audio_lessons",
+    "lessons",
     "anamnesis",
     "anamnesis_reps",
 )
@@ -119,7 +116,7 @@ def probe_database() -> dict:
             schema_version = cur.fetchone()[0]
         conn.close()
         missing = sorted(set(REQUIRED_TABLES) - tables)
-        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 6
+        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 8
         return {
             "ok": ok,
             "database": database,

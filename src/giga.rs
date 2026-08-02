@@ -1985,16 +1985,20 @@ pub async fn giga_promote(
                     .await?
             }
             GigaPromotionKind::CodingLesson => {
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coding_lessons WHERE id=$1)")
-                    .bind(durable_id)
-                    .fetch_one(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM lessons WHERE lesson_key='coding' AND id=$1)",
+                )
+                .bind(durable_id)
+                .fetch_one(&mut *tx)
+                .await?
             }
             GigaPromotionKind::ProjectLesson => {
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_lessons WHERE id=$1)")
-                    .bind(durable_id)
-                    .fetch_one(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM lessons WHERE lesson_key='project' AND id=$1)",
+                )
+                .bind(durable_id)
+                .fetch_one(&mut *tx)
+                .await?
             }
         };
         if !durable_exists {

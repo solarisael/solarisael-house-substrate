@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Query audio_lessons before recording, treating, or debugging audio.
+"""Query audio lessons before recording, treating, or debugging audio.
 
-Parallels query_coding_lessons / query_writing_lessons. Ranking:
+Parallels the coding and writing lesson queries. Ranking:
   1. spine rows (shape='spine') -- always-on, first
   2. stage-match  (--stage overlaps the row's stage[])
   3. shape-match  (--shape equals the row's shape)
@@ -72,14 +72,17 @@ def fetch_rows(cur, *, query, stages, shape, limit, show_all):
                (%(stages)s::text[] && stage)              AS stage_hit,
                (shape = %(shape)s)                        AS shape_hit,
                CASE WHEN %(q)s <> '' THEN
-                 ts_rank(search, plainto_tsquery('english', %(q)s))
+                 ts_rank(lesson_tsv, plainto_tsquery('english', %(q)s))
                ELSE 0 END                                 AS rank
-        FROM audio_lessons
-        WHERE %(all)s
-           OR shape = 'spine'
-           OR (%(stages)s::text[] && stage)
-           OR (shape = %(shape)s)
-           OR (%(q)s <> '' AND search @@ plainto_tsquery('english', %(q)s))
+        FROM lessons
+        WHERE lesson_key = 'audio'
+          AND (
+               %(all)s
+            OR shape = 'spine'
+            OR (%(stages)s::text[] && stage)
+            OR (shape = %(shape)s)
+            OR (%(q)s <> '' AND lesson_tsv @@ plainto_tsquery('english', %(q)s))
+          )
         ORDER BY is_spine DESC, stage_hit DESC, shape_hit DESC, rank DESC, id ASC
         LIMIT %(limit)s
         """,
@@ -98,7 +101,8 @@ def fetch_by_ids(cur, ids):
     if not ids:
         return {}
     cur.execute(
-        "SELECT id, shape, title, lesson FROM audio_lessons WHERE id = ANY(%s)",
+        "SELECT id, shape, title, lesson FROM lessons "
+        "WHERE lesson_key = 'audio' AND id = ANY(%s)",
         (ids,),
     )
     return {r["id"]: r for r in cur.fetchall()}
@@ -143,7 +147,8 @@ def main() -> int:
                 cur.execute(
                     "SELECT id, shape, stage, title, lesson, trigger_context, "
                     "example_cmd, tools, negation_of, tags, source_memory_path "
-                    "FROM audio_lessons WHERE shape = 'spine' ORDER BY id"
+                    "FROM lessons WHERE lesson_key = 'audio' "
+                    "AND shape = 'spine' ORDER BY id"
                 )
                 rows = cur.fetchall()
             else:

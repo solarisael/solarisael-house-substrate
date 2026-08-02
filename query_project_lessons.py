@@ -41,8 +41,9 @@ def fetch_rows(cur, project: str, query: str | None, limit: int):
         cur.execute(
             """
             SELECT id, project, title, lesson, trigger_context, proof_pattern, tags
-            FROM project_lessons
-            WHERE project = %s
+            FROM lessons
+            WHERE lesson_key = 'project'
+              AND project = %s
             ORDER BY updated_at DESC, id DESC
             LIMIT %s
             """,
@@ -56,8 +57,9 @@ def fetch_rows(cur, project: str, query: str | None, limit: int):
           SELECT id, project, title, lesson, trigger_context, proof_pattern, tags,
                  ts_rank(lesson_tsv, plainto_tsquery('portuguese', %s)) AS body_rank,
                  similarity(title, %s) AS title_sim
-          FROM project_lessons
-          WHERE project = %s
+          FROM lessons
+          WHERE lesson_key = 'project'
+            AND project = %s
         )
         SELECT id, project, title, lesson, trigger_context, proof_pattern, tags
         FROM scored

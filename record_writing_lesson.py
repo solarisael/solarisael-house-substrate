@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Direct write helper for solarisael_memory.writing_lessons.
+"""Direct write helper for writing lessons.
 
-Parallels record_coding_lesson.py with two writing-specific axes:
+Parallels the coding lesson helper with two writing-specific axes:
 
   --register R    text[] array of writing contexts the rule applies to.
                   Repeatable. e.g. --register nigredo --register video-rant.
@@ -91,7 +91,8 @@ def resolve_negation_id(cur, *, neg_id: int | None, neg_title: str | None,
 
     if voice:
         cur.execute(
-            "SELECT id FROM writing_lessons WHERE title = %s AND voice = %s LIMIT 1",
+            "SELECT id FROM lessons "
+            "WHERE lesson_key = 'writing' AND title = %s AND voice = %s LIMIT 1",
             (neg_title, voice),
         )
         row = cur.fetchone()
@@ -99,7 +100,7 @@ def resolve_negation_id(cur, *, neg_id: int | None, neg_title: str | None,
             return int(row["id"])
 
     cur.execute(
-        "SELECT id FROM writing_lessons WHERE title = %s LIMIT 1",
+        "SELECT id FROM lessons WHERE lesson_key = 'writing' AND title = %s LIMIT 1",
         (neg_title,),
     )
     row = cur.fetchone()
@@ -171,13 +172,13 @@ def main() -> int:
 
             cur.execute(
                 """
-                INSERT INTO writing_lessons
-                  (voice, register, shape, title, lesson, trigger_context,
+                INSERT INTO lessons
+                  (lesson_key, voice, register, shape, title, lesson, trigger_context,
                    example_text, writers, negation_of, tags,
                    source_memory_path, source_lines_start, source_lines_end, meta)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (voice, title) DO UPDATE SET
+                  ('writing', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (voice, title) WHERE lesson_key = 'writing' DO UPDATE SET
                   register = EXCLUDED.register,
                   shape = EXCLUDED.shape,
                   lesson = EXCLUDED.lesson,
