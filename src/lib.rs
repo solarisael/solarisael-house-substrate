@@ -24,7 +24,7 @@ pub use giga::{
     giga_review,
 };
 pub use giga_worker::giga_process;
-pub use recall::{RecallParams, RecallResult, recall};
+pub use recall::{RecallParams, RecallResult, recall, refresh_semantic_vocabulary};
 pub use remember::{RememberReceipt, RememberRequest, ThreadContinuation, remember};
 
 #[cfg(test)]

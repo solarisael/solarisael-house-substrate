@@ -23,7 +23,7 @@ use solarisael_house_substrate::{
     RememberRequest, ThreadContinuation as ServiceThreadContinuation, anamnesis, anamnesis_write,
     cluster_maintenance, giga_candidate_list, giga_event_claim, giga_event_finish,
     giga_event_ingest, giga_event_replay, giga_health, giga_process, giga_promote,
-    giga_queue_maintenance, giga_review, recall, remember,
+    giga_queue_maintenance, giga_review, recall, refresh_semantic_vocabulary, remember,
 };
 use std::{
     env,
@@ -363,6 +363,14 @@ async fn cli_subcommand() -> Result<bool, Box<dyn std::error::Error>> {
             )
             .await?;
             println!("{{\"ok\":true}}");
+        }
+        "semantic-vocabulary-refresh" => {
+            if !args.is_empty() {
+                return Err("semantic-vocabulary-refresh: no arguments accepted".into());
+            }
+            let pool = config.pool().await.map_err(|error| error.to_string())?;
+            let refreshed = refresh_semantic_vocabulary(&pool, &config).await?;
+            println!("{{\"ok\":true,\"refreshed\":{refreshed}}}");
         }
         _ => return Err(format!("unknown subcommand: {command}").into()),
     }

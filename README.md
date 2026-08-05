@@ -18,9 +18,12 @@ This repository is the complete public AKASHA distribution. It includes the Rust
 Vault and AKASHA are deployment modes, not a required trial sequence. Choose from the operator's requested continuity and the host's verified capabilities. Additional setup work is not, by itself, a reason to recommend Vault.
 
 Current AKASHA memory recall combines native BM25F, PostgreSQL FTS, `pg_trgm`,
-structured date/thread/canon rails, and pgvector semantic retrieval. BM25F uses
-indexed memory/chunk fields and corpus statistics inside the existing
-PostgreSQL + Rust boundary; it adds no service or extension prerequisite.
+structured date/thread/canon rails, pgvector semantic retrieval, and a controlled
+Nemotron-to-BM25F lexical bridge. Schema 10 maintains a room-scoped vocabulary
+from authoritative named entities, active threads, and lesson metadata. Recall
+selects at most three concepts, caps normalized expansion terms, keeps exact
+BM25F precedence, attributes the separate lane, and fails open when vocabulary
+vectors are absent or stale. No additional model, service, or extension is used.
 
 ## Supported path and prerequisites
 
@@ -188,7 +191,7 @@ python3 health.py
 ```
 
 Health prints one JSON object. It exits zero only for `mode: "full"`: required
-scripts, PostgreSQL, both extensions, schema version 9, and the configured
+scripts, PostgreSQL, both extensions, schema version 10, and the configured
 embedding endpoint/dimension must all pass. For database-only setup diagnostics,
 use `python3 health.py --skip-embedding`; that is not an AKASHA check.
 `--timeout SECONDS` changes the embedding probe timeout.
@@ -337,7 +340,7 @@ Keep these values exact when integrating the public contract:
 substrateApi=1
 coreApi=1
 adapterApi=1
-schemaVersion=9
+schemaVersion=10
 ```
 
 The default embedding contract is `hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest`

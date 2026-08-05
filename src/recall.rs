@@ -163,13 +163,18 @@ pub(crate) fn term_evidence(terms: &[String], fields: &[&str]) -> (Vec<String>, 
 // look higher while separating nothing, and the true/noise gap goes negative.
 // The indexer's `passage: ` and this `query: ` are one decision — project
 // lesson 126 (the-athanor) carries the measured comparison.
-async fn embed_query(
+async fn embed_texts(
     client: &Client,
     url: &str,
     model: &str,
-    query: &str,
+    prefix: &str,
+    texts: &[String],
     dim: usize,
-) -> Result<Vec<f32>, AppError> {
+    timeout: Duration,
+) -> Result<Vec<Vec<f32>>, AppError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
     // The embedder is on the hot path — every user prompt embeds a query. Ollama's
     // default 5 minute keep_alive evicted it during idle gaps and charged a cold
     // reload on the next turn, which is felt directly as latency. Residency costs
@@ -182,10 +187,13 @@ async fn embed_query(
     }
     let value: serde_json::Value = client
         .post(url)
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         .json(&Input {
             model,
-            input: vec![format!("query: {query}")],
+            input: texts
+                .iter()
+                .map(|text| format!("{prefix}: {text}"))
+                .collect(),
             keep_alive: "30m",
         })
         .send()
@@ -196,32 +204,77 @@ async fn embed_query(
         .json()
         .await
         .map_err(|e| AppError::Embedding(e.to_string()))?;
-    let item = value
+    let items = value
         .get("embeddings")
         .or_else(|| value.get("data"))
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| AppError::Embedding("response lacks query embedding".into()))?;
-    let v = item
-        .as_array()
-        .or_else(|| item.get("embedding").and_then(|x| x.as_array()))
-        .ok_or_else(|| AppError::Embedding("invalid query embedding".into()))?;
-    let row = v
-        .iter()
-        .map(|x| {
-            x.as_f64()
-                .map(|n| n as f32)
-                .ok_or_else(|| AppError::Embedding("non-numeric query embedding".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if row.len() != dim {
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Embedding("response lacks embeddings".into()))?;
+    if items.len() != texts.len() {
         return Err(AppError::Embedding(format!(
-            "embedding dimension {} != {}",
-            row.len(),
-            dim
+            "embedding count {} != {}",
+            items.len(),
+            texts.len()
         )));
     }
-    Ok(row)
+    items
+        .iter()
+        .map(|item| {
+            let values = item
+                .as_array()
+                .or_else(|| item.get("embedding").and_then(serde_json::Value::as_array))
+                .ok_or_else(|| AppError::Embedding("invalid embedding".into()))?;
+            let row = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_f64()
+                        .map(|number| number as f32)
+                        .ok_or_else(|| AppError::Embedding("non-numeric embedding".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if row.len() != dim {
+                return Err(AppError::Embedding(format!(
+                    "embedding dimension {} != {}",
+                    row.len(),
+                    dim
+                )));
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
+async fn embed_text(
+    client: &Client,
+    url: &str,
+    model: &str,
+    prefix: &str,
+    text: &str,
+    dim: usize,
+) -> Result<Vec<f32>, AppError> {
+    embed_texts(
+        client,
+        url,
+        model,
+        prefix,
+        &[text.to_owned()],
+        dim,
+        Duration::from_secs(20),
+    )
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| AppError::Embedding("response lacks embedding".into()))
+}
+
+async fn embed_query(
+    client: &Client,
+    url: &str,
+    model: &str,
+    query: &str,
+    dim: usize,
+) -> Result<Vec<f32>, AppError> {
+    embed_text(client, url, model, "query", query, dim).await
 }
 
 pub(crate) fn bounded_excerpt(body: &str) -> String {
@@ -321,15 +374,14 @@ struct Bm25fAverageLengths {
     memory_type: f64,
 }
 
-async fn load_bm25f_candidates(
+async fn load_bm25f_candidates_for_terms(
     pool: &PgPool,
     rooms: &[String],
-    query: &str,
+    terms: &[String],
     temporal_decay: bool,
     decay_now: DateTime<Utc>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    let terms = bm25f::query_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -541,6 +593,168 @@ async fn load_bm25f_candidates(
     Ok(candidates)
 }
 
+async fn load_bm25f_candidates(
+    pool: &PgPool,
+    rooms: &[String],
+    query: &str,
+    temporal_decay: bool,
+    decay_now: DateTime<Utc>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    load_bm25f_candidates_for_terms(
+        pool,
+        rooms,
+        &bm25f::query_terms(query),
+        temporal_decay,
+        decay_now,
+        warnings,
+    )
+    .await
+}
+
+const SEMANTIC_VOCABULARY_TOP_K: i64 = 3;
+// Terse concept vectors score lower than memory passages: measured paraphrases
+// land at 0.30-0.37 while direct domain phrases exceed 0.45.
+const SEMANTIC_VOCABULARY_MIN_SIMILARITY: f64 = 0.30;
+const SEMANTIC_VOCABULARY_MAX_TERMS: usize = 12;
+
+fn semantic_vocabulary_terms(concepts: &[serde_json::Value]) -> Vec<String> {
+    concepts
+        .iter()
+        .flat_map(|concept| {
+            concept["terms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+        })
+        .flat_map(bm25f::query_terms)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(SEMANTIC_VOCABULARY_MAX_TERMS)
+        .collect()
+}
+
+async fn load_semantic_vocabulary_concepts(
+    pool: &PgPool,
+    rooms: &[String],
+    vector_text: &str,
+    cfg: &Config,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let rows =
+        sqlx::query(
+            r#"SELECT concept, lexical_terms, source_kind,
+                  (1 - (embedding <=> $1::vector))::double precision AS similarity
+           FROM semantic_vocabulary
+           WHERE room = ANY($2::text[])
+             AND approved_source_kind = source_kind
+             AND embedding IS NOT NULL
+             AND embedding_model = $3
+             AND embedding_dimension = $4
+             AND embedded_at >= source_updated_at
+           ORDER BY similarity DESC, concept, source_kind, source_key
+           LIMIT $5"#,
+        )
+        .bind(vector_text)
+        .bind(rooms)
+        .bind(&cfg.embed_model)
+        .bind(i32::try_from(cfg.embed_dimension).map_err(|_| {
+            AppError::Config("embedding dimension exceeds PostgreSQL integer".into())
+        })?)
+        .bind(SEMANTIC_VOCABULARY_TOP_K)
+        .fetch_all(pool)
+        .await?;
+    let mut concepts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let similarity: f64 = row.try_get("similarity")?;
+        if similarity < SEMANTIC_VOCABULARY_MIN_SIMILARITY {
+            continue;
+        }
+        concepts.push(serde_json::json!({
+            "concept": row.try_get::<String, _>("concept")?,
+            "terms": row.try_get::<Vec<String>, _>("lexical_terms")?,
+            "source_kind": row.try_get::<String, _>("source_kind")?,
+            "similarity": similarity,
+        }));
+    }
+    Ok(concepts)
+}
+
+pub async fn refresh_semantic_vocabulary(pool: &PgPool, cfg: &Config) -> Result<usize, AppError> {
+    let url = cfg.embed_url.as_deref().ok_or_else(|| {
+        AppError::Config("semantic vocabulary refresh requires SOLARISAEL_EMBED_URL".into())
+    })?;
+    if cfg.test_embedding_disabled {
+        return Err(AppError::Config(
+            "semantic vocabulary refresh is unavailable while embedding is disabled".into(),
+        ));
+    }
+    sqlx::query("SELECT substrate_refresh_semantic_vocabulary_sources()")
+        .execute(pool)
+        .await?;
+    let rows =
+        sqlx::query(
+            r#"SELECT room, source_kind, source_key, concept, lexical_terms
+           FROM semantic_vocabulary
+           WHERE embedding IS NULL
+              OR embedding_model IS DISTINCT FROM $1
+              OR embedding_dimension IS DISTINCT FROM $2
+              OR embedded_at < source_updated_at
+           ORDER BY room, source_kind, source_key"#,
+        )
+        .bind(&cfg.embed_model)
+        .bind(i32::try_from(cfg.embed_dimension).map_err(|_| {
+            AppError::Config("embedding dimension exceeds PostgreSQL integer".into())
+        })?)
+        .fetch_all(pool)
+        .await?;
+    const VOCABULARY_EMBED_BATCH_SIZE: usize = 16;
+    for batch in rows.chunks(VOCABULARY_EMBED_BATCH_SIZE) {
+        let passages = batch
+            .iter()
+            .map(|row| {
+                let concept = row.try_get::<String, _>("concept")?;
+                let terms = row.try_get::<Vec<String>, _>("lexical_terms")?;
+                Ok(format!("{concept}\n{}", terms.join(" ")))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let vectors = embed_texts(
+            &HTTP_CLIENT,
+            url,
+            &cfg.embed_model,
+            "passage",
+            &passages,
+            cfg.embed_dimension,
+            Duration::from_secs(120),
+        )
+        .await?;
+        for (row, vector) in batch.iter().zip(vectors) {
+            let vector_text = format!(
+                "[{}]",
+                vector
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            sqlx::query(
+                r#"UPDATE semantic_vocabulary
+                   SET embedding = $1::vector, embedding_model = $2, embedding_dimension = $3, embedded_at = NOW()
+                   WHERE room = $4 AND source_kind = $5 AND source_key = $6"#,
+            )
+            .bind(vector_text)
+            .bind(&cfg.embed_model)
+            .bind(i32::try_from(cfg.embed_dimension).map_err(|_| AppError::Config("embedding dimension exceeds PostgreSQL integer".into()))?)
+            .bind(row.try_get::<String, _>("room")?)
+            .bind(row.try_get::<String, _>("source_kind")?)
+            .bind(row.try_get::<String, _>("source_key")?)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(rows.len())
+}
+
 async fn load_thread_neighbors(
     pool: &PgPool,
     memory_ids: &[i64],
@@ -683,6 +897,27 @@ pub async fn recall(
         pool,
         &rooms,
         &params.query,
+        params.temporal_decay,
+        decay_now,
+        &mut warnings,
+    )
+    .await?;
+    let semantic_vocabulary_concepts = match vector_text.as_deref() {
+        Some(vector) => match load_semantic_vocabulary_concepts(pool, &rooms, vector, cfg).await {
+            Ok(concepts) => concepts,
+            Err(error) => {
+                // A missing/unmigrated/stale vocabulary must never impair exact recall.
+                warnings.push(format!("semantic lexical bridge absent: {error}"));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let semantic_vocabulary_terms = semantic_vocabulary_terms(&semantic_vocabulary_concepts);
+    let semantic_lexical_candidates = load_bm25f_candidates_for_terms(
+        pool,
+        &rooms,
+        &semantic_vocabulary_terms,
         params.temporal_decay,
         decay_now,
         &mut warnings,
@@ -960,6 +1195,48 @@ pub async fn recall(
             }),
         );
     }
+    let max_semantic_lexical_score = semantic_lexical_candidates
+        .first()
+        .map(|candidate| weighted_lane_score(candidate, "bm25f_score"))
+        .unwrap_or(1.0)
+        .max(f64::EPSILON);
+    for (rank, candidate) in semantic_lexical_candidates.iter().enumerate() {
+        let memory_id = candidate["memory_id"].as_i64().unwrap_or_default();
+        // Exact BM25F has already been fused. It always owns a matching memory;
+        // this lane can only introduce otherwise-unseen candidates.
+        if fused
+            .values()
+            .any(|entry| entry["memory_id"].as_i64() == Some(memory_id))
+        {
+            continue;
+        }
+        let normalized = weighted_lane_score(candidate, "bm25f_score") / max_semantic_lexical_score;
+        let lane_score = normalized * 0.15 + 1.0 / (rank as f64 + 1.0) * 0.05;
+        let chunk_index = candidate["chunk_index"].as_i64().unwrap_or_default();
+        fused.insert(
+            format!("{memory_id}#{chunk_index}"),
+            serde_json::json!({
+                "memory_id": candidate["memory_id"],
+                "source_path": candidate["source_path"],
+                "title": candidate["title"],
+                "heading_path": candidate["heading_path"],
+                "excerpt": candidate["body"],
+                "sources": [candidate["source_path"].clone()],
+                "term_coverage": candidate["term_coverage"],
+                "matched_terms": candidate["matched_terms"],
+                "missing_terms": candidate["missing_terms"],
+                "score": lane_score,
+                "semantic_lexical_score": candidate["bm25f_score"],
+                "semantic_lexical_fields": candidate["bm25f_fields"],
+                "semantic_lexical_concepts": &semantic_vocabulary_concepts,
+                "durability": candidate["durability"],
+                "temporal_weight": candidate["temporal_weight"],
+                "reasons": ["semantic vocabulary expansion BM25F score"],
+                "source": "semantic_lexical_bm25f",
+                "chunk_index": candidate["chunk_index"],
+            }),
+        );
+    }
     for row in &thread_rows {
         let memory_id: i64 = row.try_get("memory_id")?;
         let source_path: String = row.try_get("source_path")?;
@@ -1070,7 +1347,10 @@ pub async fn recall(
 
 #[cfg(test)]
 mod tests {
-    use super::giga_temporal_factor;
+    use super::{
+        SEMANTIC_VOCABULARY_MAX_TERMS, SEMANTIC_VOCABULARY_TOP_K, giga_temporal_factor,
+        semantic_vocabulary_terms,
+    };
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
 
@@ -1138,5 +1418,23 @@ mod tests {
             giga_temporal_factor(&giga_meta(json!(0.0), &future_anchor), now),
             (Some(0.0), 1.0)
         );
+    }
+    #[test]
+    fn semantic_vocabulary_terms_are_deduplicated_and_hard_capped() {
+        assert_eq!(SEMANTIC_VOCABULARY_TOP_K, 3);
+        let concepts = (0..4)
+            .map(|concept| {
+                json!({
+                    "concept": format!("concept-{concept}"),
+                    "terms": (0..4).map(|term| format!("term-{concept}-{term}")).collect::<Vec<_>>(),
+                    "source_kind": "named_entity",
+                    "similarity": 0.5,
+                })
+            })
+            .collect::<Vec<_>>();
+        let terms = semantic_vocabulary_terms(&concepts);
+        assert_eq!(terms.len(), SEMANTIC_VOCABULARY_MAX_TERMS);
+        assert_eq!(terms.first().map(String::as_str), Some("term-0-0"));
+        assert_eq!(terms.last().map(String::as_str), Some("term-2-3"));
     }
 }

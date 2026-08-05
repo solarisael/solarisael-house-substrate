@@ -148,6 +148,9 @@ try {
     Invoke-Checked -Label "ordered database migrations" -FilePath $Python -ArgumentList @(
         (Join-Path $repoRoot "run_migrations.py")
     )
+    Invoke-Checked -Label "semantic vocabulary refresh" -FilePath $liveExe -ArgumentList @(
+        "semantic-vocabulary-refresh"
+    )
 } catch {
     Remove-Item $liveExe, $livePdb -Force -ErrorAction SilentlyContinue
     if (Test-Path $previousExe -PathType Leaf) {
