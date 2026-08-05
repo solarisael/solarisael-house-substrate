@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and import a coding-lesson pack into the House substrate."""
+"""Validate and import a coding-lesson pack into the Athanor substrate."""
 from __future__ import annotations
 
 import argparse

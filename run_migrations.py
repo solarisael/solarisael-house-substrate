@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply ordered Solarisael House substrate migrations exactly once."""
+"""Apply ordered Athanor substrate migrations exactly once."""
 from __future__ import annotations
 
 import argparse

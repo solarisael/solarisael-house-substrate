@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Return one explicit health verdict for the full House substrate."""
+"""Return one explicit health verdict for the AKASHA substrate."""
 from __future__ import annotations
 
 import argparse

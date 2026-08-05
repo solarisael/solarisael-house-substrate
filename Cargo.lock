@@ -1483,27 +1483,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "solarisael-house-substrate"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "house-core",
- "house-protocol",
- "percent-encoding",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1779,6 +1758,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "the-athanor-substrate"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "house-core",
+ "house-protocol",
+ "percent-encoding",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

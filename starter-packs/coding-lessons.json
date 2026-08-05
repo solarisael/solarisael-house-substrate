@@ -3,8 +3,8 @@
   "pack": {
     "id": "solarisael-house-craft-starter",
     "version": 2,
-    "title": "Solarisael House coding lesson library",
-    "description": "A privacy-safe library of 117 reusable engineering lessons from the House.",
+    "title": "The Athanor coding lesson library",
+    "description": "A privacy-safe library of 117 reusable engineering lessons from the reference House.",
     "license": "Apache-2.0"
   },
   "lessons": [

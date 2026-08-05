@@ -206,7 +206,7 @@ def build_report(
     min_count: int,
 ) -> str:
     lines = [
-        "Solarisael House digest pass",
+        "The Athanor digest pass",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
         "Mode: read-only proposal; no rows were changed.",
         "",

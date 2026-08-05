@@ -1,7 +1,7 @@
 [project]
-name = "solarisael-house-substrate"
+name = "the-athanor-substrate"
 version = "0.1.0"
-description = "PostgreSQL, pgvector, and local-embedding substrate for Solarisael House"
+description = "PostgreSQL, pgvector, and local-embedding substrate for The Athanor"
 requires-python = ">=3.11"
 dependencies = [
   "psycopg2-binary>=2.9.9,<3",

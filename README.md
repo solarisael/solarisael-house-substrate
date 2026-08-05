@@ -1,7 +1,7 @@
-# Solarisael House Substrate
+# The Athanor AKASHA Substrate
 
-**the backend that makes House memory stick — start at the [hub](https://github.com/solarisael/the-athanor).**
-This repository is the optional **AKASHA** backend: Rust, PostgreSQL, pgvector, and local embeddings for [Solarisael House](https://github.com/solarisael/the-athanor).
+**the backend that makes House memory stick — start at [The Athanor](https://github.com/solarisael/the-athanor).**
+This repository is the optional **AKASHA** backend for [The Athanor](https://github.com/solarisael/the-athanor): Rust, PostgreSQL, pgvector, and local embeddings.
 The public source is [`solarisael/solarisael-house-substrate`](https://github.com/solarisael/solarisael-house-substrate).
 
 This is the optional **AKASHA** backend. **Vault** is file-backed and
@@ -137,7 +137,7 @@ pwsh -File .\deploy-local.ps1
 The script tests the Athanor core/protocol and substrate, builds a staged
 release, takes a PostgreSQL backup, stops only substrate workers running from
 the exact configured `SOLARISAEL_HOUSE_RUST` path, replaces that executable,
-applies ordered migrations, and requires a Full-mode health result. It restores
+applies ordered migrations, and requires an AKASHA health result (`mode: "full"` for compatibility). It restores
 the prior executable if migration fails.
 
 `-SkipTests` and `-SkipBackup` exist for diagnosed recovery only; the safe
