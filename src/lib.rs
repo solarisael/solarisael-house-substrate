@@ -1,5 +1,6 @@
 mod anamnesis;
 pub mod backup;
+mod bm25f;
 mod cluster;
 mod config;
 mod giga;
