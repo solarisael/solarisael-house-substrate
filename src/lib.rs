@@ -48,6 +48,7 @@ mod tests {
             supersedes: vec![],
             shape: None,
             voice: None,
+            register: vec![],
             scope: None,
             project: None,
             proof_pattern: None,
@@ -72,6 +73,7 @@ mod tests {
             supersedes: vec![],
             shape: None,
             voice: None,
+            register: vec![],
             scope: None,
             project: None,
             proof_pattern: None,
@@ -96,6 +98,7 @@ mod tests {
             supersedes: vec![],
             shape: None,
             voice: None,
+            register: vec![],
             scope: None,
             project: None,
             proof_pattern: Some("proof".into()),
@@ -108,6 +111,12 @@ mod tests {
         assert!(project.validate().is_ok());
         project.kind = "memory".into();
         assert!(project.validate().is_err());
+
+        project.kind = "writing-lesson".into();
+        project.project = None;
+        project.proof_pattern = None;
+        project.register = vec![" product-work ".into(), "product-work".into()];
+        assert!(project.validate().is_ok());
     }
     #[test]
     fn lesson_receipt_serializes_typed_identity() {

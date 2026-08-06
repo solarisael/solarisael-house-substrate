@@ -45,6 +45,8 @@ pub struct RememberRequest {
     #[serde(default)]
     pub voice: Option<String>,
     #[serde(default)]
+    pub register: Vec<String>,
+    #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
@@ -121,6 +123,7 @@ impl RememberRequest {
                 || self.source_memory_path.is_some()
                 || self.shape.is_some()
                 || self.voice.is_some()
+                || !self.register.is_empty()
                 || self.scope.is_some()
                 || self.project.is_some()
                 || self.proof_pattern.is_some()
@@ -183,13 +186,16 @@ impl RememberRequest {
                 ));
             }
             let unsupported = match self.kind.as_str() {
-                "coding-lesson" => false,
-                "project-lesson" => self.voice.is_some() || self.scope.is_some(),
+                "coding-lesson" => !self.register.is_empty(),
+                "project-lesson" => {
+                    self.voice.is_some() || !self.register.is_empty() || self.scope.is_some()
+                }
                 "writing-lesson" => {
                     self.scope.is_some() || self.project.is_some() || self.proof_pattern.is_some()
                 }
                 "audio-lesson" => {
                     self.voice.is_some()
+                        || !self.register.is_empty()
                         || self.scope.is_some()
                         || self.project.is_some()
                         || self.proof_pattern.is_some()
@@ -258,13 +264,7 @@ pub async fn remember(
         &prepared,
     )
     .await?;
-    write_continuations_tx(
-        &mut tx,
-        &req.room,
-        memory_id,
-        &req.continues,
-    )
-    .await?;
+    write_continuations_tx(&mut tx, &req.room, memory_id, &req.continues).await?;
     tx.commit().await?;
     if req.backup
         && let Err(error) = backup::run_post_write(pool, &cfg.database_url).await
@@ -470,9 +470,7 @@ async fn write_continuations_tx(
             continue;
         }
         if continuation.previous_memory_id == memory_id {
-            return Err(AppError::Invalid(
-                "a memory cannot continue itself".into(),
-            ));
+            return Err(AppError::Invalid("a memory cannot continue itself".into()));
         }
         let events = sqlx::query(
             "SELECT current_event.thread_id,
@@ -608,6 +606,7 @@ async fn remember_lesson(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let register = normalize_strings(&req.register);
     let meta = serde_json::json!({
         "origin": "direct-db-write",
         "kind": req.kind,
@@ -642,8 +641,8 @@ async fn remember_lesson(
             meta,
         )
         .await?,
-        "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,voice,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('writing','house',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (voice,title) WHERE lesson_key='writing' DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
-            .bind(req.voice.as_deref().unwrap_or("general")).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,voice,register,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('writing','house',$1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (voice,title) WHERE lesson_key='writing' DO UPDATE SET register=EXCLUDED.register,shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(req.voice.as_deref().unwrap_or("general")).bind(&register).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('audio','house',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (title) WHERE lesson_key='audio' DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
             .bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         _ => return Err(AppError::Invalid("unsupported remember kind".into())),
@@ -666,6 +665,16 @@ async fn remember_lesson(
         authority: "postgres",
         warnings,
     })
+}
+
+pub(crate) fn normalize_strings(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && seen.insert(*value))
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn normalize_threads(values: &[String]) -> Vec<String> {

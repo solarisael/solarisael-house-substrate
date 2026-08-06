@@ -108,6 +108,7 @@ fn remember_service_request(
         supersedes,
         shape: request.shape().map(str::to_owned),
         voice: request.voice().map(str::to_owned),
+        register: request.register().to_vec(),
         scope: request.scope().map(str::to_owned),
         project: request.project().map(str::to_owned),
         proof_pattern: request.proof_pattern().map(str::to_owned),
