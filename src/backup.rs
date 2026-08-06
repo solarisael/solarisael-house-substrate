@@ -336,9 +336,10 @@ pub fn backup_with_migrations(
         return Err(BackupError::Config("keep must be at least 1".into()));
     }
     if !known_migration_lineage(&source) {
-        return Err(BackupError::Manifest(
-            "database schema migrations are unsupported".into(),
-        ));
+        return Err(BackupError::Manifest(format!(
+            "database schema migrations are unsupported: {}",
+            source.join(", ")
+        )));
     }
     fs::create_dir_all(output_dir)?;
     let (db, password, safe) = db_parts(database_url)?;
@@ -398,12 +399,27 @@ pub fn backup(database_url: &str, output_dir: &Path, keep: usize) -> Result<Mani
             .collect(),
     )
 }
+
+fn normalize_migration_order(mut versions: Vec<String>) -> Vec<String> {
+    if versions
+        .iter()
+        .all(|version| version.parse::<u64>().is_ok())
+    {
+        versions.sort_by_key(|version| version.parse::<u64>().unwrap_or(u64::MAX));
+    } else {
+        versions.sort();
+    }
+    versions
+}
+
 pub async fn source_migrations(pool: &PgPool) -> Result<Vec<String>, BackupError> {
-    let rows = sqlx::query("SELECT version::text FROM schema_migrations ORDER BY version")
+    let rows = sqlx::query("SELECT version::text FROM schema_migrations")
         .fetch_all(pool)
         .await
         .map_err(|e| BackupError::Command(format!("migration query: {e}")))?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+    Ok(normalize_migration_order(
+        rows.into_iter().map(|r| r.get::<String, _>(0)).collect(),
+    ))
 }
 pub async fn restore_checked(
     pool: &PgPool,
@@ -521,6 +537,21 @@ mod tests {
         assert!(!known_migration_lineage(&[]));
         assert!(!known_migration_lineage(&["0001".into(), "0002".into()]));
         assert!(!known_migration_lineage(&["1".into(), "3".into()]));
+    }
+
+    #[test]
+    fn migration_order_is_numeric_for_consolidated_and_lexical_for_legacy_versions() {
+        assert_eq!(
+            normalize_migration_order(vec!["1".into(), "10".into(), "2".into()]),
+            ["1", "2", "10"]
+        );
+        assert_eq!(
+            normalize_migration_order(vec![
+                "0002_memory_threads_pivot".into(),
+                "0001_create_memories".into(),
+            ]),
+            ["0001_create_memories", "0002_memory_threads_pivot"]
+        );
     }
 
     #[test]
