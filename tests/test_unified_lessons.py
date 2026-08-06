@@ -10,6 +10,8 @@ import query_project_lessons
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "0008_unified_lessons.sql"
+DESIGN_MIGRATION = ROOT / "migrations" / "0011_design_lessons.sql"
+DESIGN_RECORDER = ROOT / "record_design_lesson.py"
 
 
 class RecordingCursor:
@@ -133,6 +135,46 @@ class UnifiedLessonMigrationTests(unittest.TestCase):
                 re.MULTILINE,
             )
             self.assertRegex(self.sql, pattern)
+
+
+class DesignLessonMigrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sql = DESIGN_MIGRATION.read_text(encoding="utf-8")
+
+    def test_design_identity_index_is_isolated_to_its_lesson_key(self) -> None:
+        self.assertRegex(
+            self.sql,
+            re.compile(
+                r"CREATE UNIQUE INDEX lessons_design_identity_uidx\s+"
+                r"ON lessons \(voice, title\) NULLS NOT DISTINCT\s+"
+                r"WHERE lesson_key = 'design';",
+                re.MULTILINE,
+            ),
+        )
+
+    def test_design_contract_fields_already_exist_in_unified_lessons(self) -> None:
+        unified = MIGRATION.read_text(encoding="utf-8")
+        for field in (
+            "voice TEXT",
+            "register TEXT[]",
+            "shape TEXT",
+            "proof_pattern TEXT",
+            "trigger_context TEXT",
+            "example_text TEXT",
+            "tags TEXT[]",
+        ):
+            self.assertIn(field, unified)
+        self.assertNotIn("ADD COLUMN", self.sql)
+
+    def test_design_recorder_upsert_is_isolated_to_design_rows(self) -> None:
+        recorder = DESIGN_RECORDER.read_text(encoding="utf-8")
+        self.assertIn("('design', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)", recorder)
+        self.assertIn("ON CONFLICT (voice, title) WHERE lesson_key = 'design' DO UPDATE SET", recorder)
+
+    def test_design_migration_registers_schema_version_eleven(self) -> None:
+        self.assertIn("INSERT INTO schema_migrations (version) VALUES (11)", self.sql)
+        self.assertIn("ON CONFLICT (version) DO NOTHING", self.sql)
 
 
 if __name__ == "__main__":

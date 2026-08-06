@@ -19,8 +19,10 @@ Vault and AKASHA are deployment modes, not a required trial sequence. Choose fro
 
 Current AKASHA memory recall combines native BM25F, PostgreSQL FTS, `pg_trgm`,
 structured date/thread/canon rails, pgvector semantic retrieval, and a controlled
-Nemotron-to-BM25F lexical bridge. Schema 10 maintains a room-scoped vocabulary
-from authoritative named entities, active threads, and lesson metadata. Recall
+Nemotron-to-BM25F lexical bridge. Schema 12 maintains a room-scoped vocabulary
+from authoritative named entities, active threads, and lesson metadata, adds
+the unified design-lesson family, and introduces the design-system document
+catalogue. Recall
 selects at most three concepts, caps normalized expansion terms, keeps exact
 BM25F precedence, attributes the separate lane, and fails open when vocabulary
 vectors are absent or stale. No additional model, service, or extension is used.
@@ -191,7 +193,7 @@ python3 health.py
 ```
 
 Health prints one JSON object. It exits zero only for `mode: "full"`: required
-scripts, PostgreSQL, both extensions, schema version 10, and the configured
+scripts, PostgreSQL, both extensions, schema version 12, and the configured
 embedding endpoint/dimension must all pass. For database-only setup diagnostics,
 use `python3 health.py --skip-embedding`; that is not an AKASHA check.
 `--timeout SECONDS` changes the embedding probe timeout.
@@ -234,6 +236,9 @@ python3 record_project_lesson.py \
 python3 record_writing_lesson.py \
   --title 'Prefer concrete verbs' --lesson 'Use the smallest true verb.' \
   --voice general --no-backup
+python3 record_design_lesson.py \
+  --title 'Keep focus visible' --lesson 'Use the focus token for every control.' \
+  --voice general --no-backup
 python3 record_audio_lesson.py \
   --title 'Check the room' --lesson 'Listen before changing gain.' \
   --stage mix --no-backup
@@ -245,6 +250,8 @@ python3 record_cabinet_entry.py --room room-key --no-backup add \
 For any writer that accepts lesson text, `--lesson-stdin` can replace
 `--lesson`.  Cabinet entries use `add` or `append-rep`; see each script's
 `--help` for its remaining typed fields.
+
+The design-system catalogue uses `design-docs.py` to query and `design-doc-write.py` to supersede rather than mutate entries.
 
 ## Starter coding lessons
 
@@ -281,8 +288,8 @@ python3 query_audio_lessons.py 'gain' --stage mix --limit 12
 python3 query_audio_lessons.py --spine
 ```
 
-No coding-lesson or writing-lesson query CLI is shipped.  Do not document or
-invoke one.
+No coding-lesson, writing-lesson, or design-lesson query CLI is shipped.  Do not
+document or invoke one.
 
 ## Backups and restore
 
@@ -296,7 +303,7 @@ It writes `backups/${PGDATABASE}_TIMESTAMP.dump` and retains the newest
 `KEEP` files.  A successful write helper invokes this script unless
 `--no-backup` is supplied.  `--no-backup` is supported by
 `record_memory.py`, `record_coding_lesson.py`, `record_project_lesson.py`,
-`record_writing_lesson.py`, `record_audio_lesson.py`,
+`record_writing_lesson.py`, `record_design_lesson.py`, `record_audio_lesson.py`,
 `record_cabinet_entry.py`, `import_markdown.py`, `import_named_entities.py`,
 and `import_coding_lessons.py`. `backup.sh` itself has no `--no-backup` option.
 
@@ -340,7 +347,7 @@ Keep these values exact when integrating the public contract:
 substrateApi=1
 coreApi=1
 adapterApi=1
-schemaVersion=10
+schemaVersion=12
 ```
 
 The default embedding contract is `hf.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF:latest`

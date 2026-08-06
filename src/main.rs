@@ -113,6 +113,7 @@ fn remember_service_request(
         project: request.project().map(str::to_owned),
         proof_pattern: request.proof_pattern().map(str::to_owned),
         trigger_context: request.trigger_context().map(str::to_owned),
+        example_text: request.example_text().map(str::to_owned),
         tags: request.tags().to_vec(),
         backup: request.backup(),
     })

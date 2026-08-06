@@ -54,6 +54,8 @@ pub struct RememberRequest {
     pub proof_pattern: Option<String>,
     #[serde(default, alias = "triggerContext")]
     pub trigger_context: Option<String>,
+    #[serde(default, alias = "exampleText")]
+    pub example_text: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default = "default_backup")]
@@ -110,6 +112,7 @@ impl RememberRequest {
             "project-lesson",
             "writing-lesson",
             "audio-lesson",
+            "design-lesson",
         ];
         let text = self.lesson.as_deref().unwrap_or(&self.body);
         if self.title.trim().is_empty() {
@@ -128,6 +131,7 @@ impl RememberRequest {
                 || self.project.is_some()
                 || self.proof_pattern.is_some()
                 || self.trigger_context.is_some()
+                || self.example_text.is_some()
                 || !self.tags.is_empty()
             {
                 return Err(AppError::Invalid(
@@ -186,9 +190,12 @@ impl RememberRequest {
                 ));
             }
             let unsupported = match self.kind.as_str() {
-                "coding-lesson" => !self.register.is_empty(),
+                "coding-lesson" => !self.register.is_empty() || self.example_text.is_some(),
                 "project-lesson" => {
-                    self.voice.is_some() || !self.register.is_empty() || self.scope.is_some()
+                    self.voice.is_some()
+                        || !self.register.is_empty()
+                        || self.scope.is_some()
+                        || self.example_text.is_some()
                 }
                 "writing-lesson" => {
                     self.scope.is_some() || self.project.is_some() || self.proof_pattern.is_some()
@@ -199,7 +206,9 @@ impl RememberRequest {
                         || self.scope.is_some()
                         || self.project.is_some()
                         || self.proof_pattern.is_some()
+                        || self.example_text.is_some()
                 }
+                "design-lesson" => self.scope.is_some() || self.project.is_some(),
                 _ => true,
             };
             if unsupported {
@@ -607,6 +616,11 @@ async fn remember_lesson(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let register = normalize_strings(&req.register);
+    let design_register = if req.kind == "design-lesson" && register.is_empty() {
+        vec!["general".to_owned()]
+    } else {
+        Vec::new()
+    };
     let meta = serde_json::json!({
         "origin": "direct-db-write",
         "kind": req.kind,
@@ -643,6 +657,8 @@ async fn remember_lesson(
         .await?,
         "writing-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,voice,register,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('writing','house',$1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (voice,title) WHERE lesson_key='writing' DO UPDATE SET register=EXCLUDED.register,shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
             .bind(req.voice.as_deref().unwrap_or("general")).bind(&register).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
+        "design-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,voice,register,shape,title,lesson,trigger_context,proof_pattern,example_text,tags,source_memory_path,meta) VALUES ('design','house',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (voice,title) WHERE lesson_key='design' DO UPDATE SET register=EXCLUDED.register,shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,proof_pattern=EXCLUDED.proof_pattern,example_text=EXCLUDED.example_text,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
+            .bind(req.voice.as_deref().unwrap_or("general")).bind(if design_register.is_empty() { &register } else { &design_register }).bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&req.proof_pattern).bind(&req.example_text).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         "audio-lesson" => sqlx::query_scalar::<_, i64>("INSERT INTO lessons (lesson_key,scope,shape,title,lesson,trigger_context,tags,source_memory_path,meta) VALUES ('audio','house',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (title) WHERE lesson_key='audio' DO UPDATE SET shape=EXCLUDED.shape,lesson=EXCLUDED.lesson,trigger_context=EXCLUDED.trigger_context,tags=EXCLUDED.tags,source_memory_path=EXCLUDED.source_memory_path,meta=EXCLUDED.meta RETURNING id")
             .bind(&req.shape).bind(&req.title).bind(text).bind(&req.trigger_context).bind(&tags).bind(&req.source_memory_path).bind(meta).fetch_one(&mut *tx).await?,
         _ => return Err(AppError::Invalid("unsupported remember kind".into())),
@@ -650,7 +666,7 @@ async fn remember_lesson(
     tx.commit().await?;
     let mut warnings = Vec::new();
     if req.backup
-        && matches!(req.kind.as_str(), "project-lesson" | "audio-lesson")
+        && matches!(req.kind.as_str(), "project-lesson" | "audio-lesson" | "design-lesson")
         && let Err(error) = backup::run_post_write(pool, &cfg.database_url).await
     {
         warnings.push(format!("backup failed: {error}"));

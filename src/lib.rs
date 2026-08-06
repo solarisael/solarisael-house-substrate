@@ -53,6 +53,7 @@ mod tests {
             project: None,
             proof_pattern: None,
             trigger_context: None,
+            example_text: None,
             tags: vec![],
             backup: false,
         };
@@ -78,6 +79,7 @@ mod tests {
             project: None,
             proof_pattern: None,
             trigger_context: None,
+            example_text: None,
             tags: vec![],
             backup: false,
         };
@@ -103,6 +105,7 @@ mod tests {
             project: None,
             proof_pattern: Some("proof".into()),
             trigger_context: None,
+            example_text: None,
             tags: vec!["a".into()],
             backup: false,
         };
@@ -119,6 +122,41 @@ mod tests {
         assert!(project.validate().is_ok());
     }
     #[test]
+    fn design_lesson_validation_accepts_contract_fields_and_refuses_project_scope() {
+        let mut design = RememberRequest {
+            room: "room".into(),
+            kind: "design-lesson".into(),
+            title: "t".into(),
+            body: "unicode\n多行".into(),
+            lesson: None,
+            source_path: None,
+            source_memory_path: None,
+            threads: vec![],
+            continues: vec![],
+            supersedes: vec![],
+            shape: None,
+            voice: None,
+            register: vec![],
+            scope: None,
+            project: None,
+            proof_pattern: None,
+            trigger_context: None,
+            example_text: None,
+            tags: vec![],
+            backup: false,
+        };
+        design.voice = Some("house-design".into());
+        design.shape = Some("component-contract".into());
+        design.proof_pattern = Some("Check keyboard navigation.".into());
+        design.trigger_context = Some("Before changing a component.".into());
+        design.example_text = Some("Use the existing token.".into());
+        assert!(design.validate().is_ok());
+
+        design.scope = Some("project".into());
+        assert!(design.validate().is_err());
+    }
+
+    #[test]
     fn lesson_receipt_serializes_typed_identity() {
         let value = serde_json::to_value(RememberReceipt {
             memory_id: 0,
@@ -133,6 +171,23 @@ mod tests {
         .unwrap();
         assert_eq!(value["lesson_id"], 7);
         assert_eq!(value["kind"], "writing-lesson");
+        assert!(value.get("memory_id").is_none());
+    }
+    #[test]
+    fn design_lesson_receipt_serializes_typed_identity() {
+        let value = serde_json::to_value(RememberReceipt {
+            memory_id: 0,
+            lesson_id: 8,
+            kind: "design-lesson".into(),
+            room: "room".into(),
+            source_path: "db-only/x".into(),
+            durable: true,
+            authority: "postgres",
+            warnings: vec![],
+        })
+        .unwrap();
+        assert_eq!(value["lesson_id"], 8);
+        assert_eq!(value["kind"], "design-lesson");
         assert!(value.get("memory_id").is_none());
     }
     #[test]

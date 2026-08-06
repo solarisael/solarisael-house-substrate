@@ -25,6 +25,7 @@ REQUIRED_SCRIPTS = (
     "record_coding_lesson.py",
     "record_project_lesson.py",
     "record_writing_lesson.py",
+    "record_design_lesson.py",
     "record_audio_lesson.py",
     "record_cabinet_entry.py",
 )
@@ -40,6 +41,7 @@ REQUIRED_TABLES = (
     "semantic_vocabulary",
     "anamnesis",
     "anamnesis_reps",
+    "design_documents",
 )
 
 
@@ -117,7 +119,7 @@ def probe_database() -> dict:
             schema_version = cur.fetchone()[0]
         conn.close()
         missing = sorted(set(REQUIRED_TABLES) - tables)
-        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 10
+        ok = not missing and {"vector", "pg_trgm"}.issubset(extensions) and schema_version >= 12
         return {
             "ok": ok,
             "database": database,

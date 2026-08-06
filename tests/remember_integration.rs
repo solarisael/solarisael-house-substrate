@@ -130,6 +130,7 @@ async fn isolated_database_guard() {
             project: None,
             proof_pattern: None,
             trigger_context: None,
+            example_text: None,
             tags: vec![],
             backup: false,
         },
@@ -232,6 +233,7 @@ async fn ordered_thread_write_surfaces_explicit_recall_neighbors() {
             project: None,
             proof_pattern: None,
             trigger_context: None,
+            example_text: None,
             tags: vec![],
             backup: false,
         },
@@ -263,6 +265,7 @@ async fn ordered_thread_write_surfaces_explicit_recall_neighbors() {
             project: None,
             proof_pattern: None,
             trigger_context: None,
+            example_text: None,
             tags: vec![],
             backup: false,
         },
@@ -749,6 +752,7 @@ fn validate_refuses_house_room_for_every_lesson_kind() {
         "project-lesson",
         "writing-lesson",
         "audio-lesson",
+        "design-lesson",
     ] {
         let error = validation_request("house", kind)
             .validate()
@@ -758,6 +762,27 @@ fn validate_refuses_house_room_for_every_lesson_kind() {
             "unexpected refusal for {kind}: {error:?}"
         );
     }
+}
+
+#[test]
+fn validate_design_lesson_accepts_contract_fields_and_rejects_project_scope() {
+    let mut request: RememberRequest = serde_json::from_value(serde_json::json!({
+        "room": "kodo",
+        "kind": "design-lesson",
+        "title": "Token floor",
+        "lesson": "Use semantic tokens.",
+        "voice": "house-design",
+        "register": ["web"],
+        "shape": "token-contract",
+        "proofPattern": "Inspect keyboard navigation.",
+        "triggerContext": "Before changing a component.",
+        "exampleText": "Use surface-raised, not a raw color.",
+        "tags": ["tokens"],
+    }))
+    .expect("design request fixture must deserialize");
+    assert!(request.validate().is_ok());
+    request.scope = Some("project".into());
+    assert!(request.validate().is_err());
 }
 
 #[test]
